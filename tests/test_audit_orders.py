@@ -79,9 +79,11 @@ class AuditCoreTests(unittest.TestCase):
             + "A1,S1,4,open,2024-01-02T03:04:05Z,y\n"
         )
         body = findings[:-1]
-        self.assertEqual(body[0], ["duplicate", ["A1", "S1"], [2, 3]])
-        self.assertEqual(body[1], ["conflict", ["A1", "S1"], [2, 3]])
-        self.assertEqual([item[0] for item in body], ["duplicate", "conflict"])
+        # Type text sorts lexicographically, so "conflict" precedes
+        # "duplicate" when both involve the same smallest record number.
+        self.assertEqual(body[0], ["conflict", ["A1", "S1"], [2, 3]])
+        self.assertEqual(body[1], ["duplicate", ["A1", "S1"], [2, 3]])
+        self.assertEqual([item[0] for item in body], ["conflict", "duplicate"])
 
     def test_status_and_timestamp_conflicts(self) -> None:
         for col, second in [
@@ -95,7 +97,7 @@ class AuditCoreTests(unittest.TestCase):
                 row2 = ",".join(cells) + ",y\n"
                 findings, _ = self.audit(HEADER + row1 + row2)
                 kinds = [item[0] for item in findings[:-1]]
-                self.assertEqual(kinds, ["duplicate", "conflict"])
+                self.assertEqual(kinds, ["conflict", "duplicate"])
 
     def test_invalid_rows_are_excluded_from_groups(self) -> None:
         findings, n = self.audit(
@@ -189,9 +191,10 @@ class AuditCoreTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(findings[:-1], [])
 
-    def test_invalid_fields_within_a_row_are_field_ordered(self) -> None:
+    def test_invalid_fields_within_a_row_are_name_ordered(self) -> None:
         # sku, qty, status and updated_at all fail (columns are shuffled);
-        # output must follow the logical field order, not the column order.
+        # output follows the lexicographic order of the logical field names,
+        # neither the column order nor the fixed logical-field order.
         header = "oid,updated_at,status,qty,sku\n"
         csv_text = header + "A1,bad-time,nope,0,\n"
         findings, _ = audit(
@@ -204,19 +207,19 @@ class AuditCoreTests(unittest.TestCase):
         )
         self.assertEqual(
             [f[2] for f in findings[:-1]],
-            ["sku", "qty", "status", "updated_at"],
+            ["qty", "sku", "status", "updated_at"],
         )
-        self.assertEqual(findings[0], ["invalid", 2, "sku", ""])
-        self.assertEqual(findings[1], ["invalid", 2, "qty", "0"])
+        self.assertEqual(findings[0], ["invalid", 2, "qty", "0"])
+        self.assertEqual(findings[1], ["invalid", 2, "sku", ""])
         self.assertEqual(findings[-2], ["invalid", 2, "updated_at", "bad-time"])
 
-    def test_duplicate_sorts_before_conflict_for_same_records(self) -> None:
+    def test_conflict_sorts_before_duplicate_for_same_records(self) -> None:
         findings, _ = self.audit(
             HEADER
             + "A1,S1,3,open,2024-01-02T03:04:05Z,x\n"
             + "A1,S1,4,open,2024-01-02T03:04:05Z,y\n"
         )
-        self.assertEqual([f[0] for f in findings[:-1]], ["duplicate", "conflict"])
+        self.assertEqual([f[0] for f in findings[:-1]], ["conflict", "duplicate"])
 
     def test_whitespace_only_lines_are_skipped_but_counted_in_record_numbers(self) -> None:
         csv_text = (
@@ -299,6 +302,135 @@ class AuditCoreTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(AuditError, "distinct"):
             audit(csv_text.encode(), overlap, "orders.csv")
+
+    def test_quoted_embedded_newline_does_not_increment_record_number(self) -> None:
+        # The note field spans two physical lines inside quotes; it is one
+        # logical record, so the next data row is record 3.
+        csv_text = (
+            HEADER
+            + '"A1",S1,3,open,2024-01-02T03:04:05Z,"line one\nline two"\n'
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,y\n"
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 2)
+        self.assertEqual(findings[0], ["duplicate", ["A1", "S1"], [2, 3]])
+
+    def test_embedded_newline_in_invalid_cell_keeps_logical_number(self) -> None:
+        csv_text = (
+            HEADER
+            + 'A1,S1,3,open,"not\na timestamp",x\n'
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,y\n"
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 2)
+        self.assertEqual(
+            findings[0], ["invalid", 2, "updated_at", "not\na timestamp"]
+        )
+
+    def test_blank_lines_occupy_logical_record_numbers(self) -> None:
+        csv_text = (
+            HEADER
+            + "\n"
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,x\n"
+            + "   \t \n"
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,y\n"
+            + "\n"
+        )
+        findings, n = self.audit(csv_text)
+        # Two blank/whitespace records consume numbers 2 and 4; data rows
+        # are records 3 and 5 and count as two data rows.
+        self.assertEqual(n, 2)
+        self.assertEqual(findings[0], ["duplicate", ["A1", "S1"], [3, 5]])
+
+    def test_embedded_newline_followed_by_blank_line_numbering(self) -> None:
+        csv_text = (
+            HEADER
+            + 'A1,S1,3,open,2024-01-02T03:04:05Z,"a\nb"\n'
+            + "\n"
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,y\n"
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 2)
+        # Multiline record is 2, blank is 3, second data row is 4.
+        self.assertEqual(findings[0], ["duplicate", ["A1", "S1"], [2, 4]])
+
+    def test_mixed_row_and_group_findings_sort_by_min_record(self) -> None:
+        csv_text = (
+            HEADER
+            + "A1,S1,3,open,2024-01-02T03:04:05Z,x\n"
+            + "A1,S1,4,open,2024-01-02T03:04:05Z,y\n"  # conflict group 2-3
+            + "B2,S9,0,open,2024-01-02T03:04:05Z,z\n"  # invalid at record 4
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 3)
+        body = findings[:-1]
+        self.assertEqual(
+            body,
+            [
+                ["conflict", ["A1", "S1"], [2, 3]],
+                ["duplicate", ["A1", "S1"], [2, 3]],
+                ["invalid", 4, "qty", "0"],
+            ],
+        )
+
+    def test_invalid_at_first_member_precedes_group_findings(self) -> None:
+        # An invalid finding at record 2 sorts after the group whose smallest
+        # member is also record 2 only by type text: "conflict"/"duplicate"
+        # both precede "invalid".  Rows that are invalid never join groups, so
+        # the group below is formed from records 3 and 4 instead.
+        csv_text = (
+            HEADER
+            + "A1,S1,0,open,2024-01-02T03:04:05Z,bad-row\n"  # record 2 invalid
+            + "C3,S8,5,open,2024-01-02T03:04:05Z,p\n"      # record 3
+            + "C3,S8,6,open,2024-01-02T03:04:05Z,q\n"      # record 4
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 3)
+        body = findings[:-1]
+        self.assertEqual(
+            body,
+            [
+                ["invalid", 2, "qty", "0"],
+                ["conflict", ["C3", "S8"], [3, 4]],
+                ["duplicate", ["C3", "S8"], [3, 4]],
+            ],
+        )
+
+    def test_multiple_multiline_groups(self) -> None:
+        # Two duplicate groups whose members contain quoted newlines; record
+        # numbers stay logical and each group reports duplicate + conflict.
+        csv_text = (
+            HEADER
+            + 'A1,S1,3,open,2024-01-02T03:04:05Z,"g1 first\nnote"\n'  # rec 2
+            + 'A1,S1,4,open,2024-01-02T03:04:05Z,"g1 second\nnote"\n'  # rec 3
+            + "\n"  # rec 4: skipped, still numbered
+            + 'B2,S2,7,open,2024-01-02T03:04:05Z,"g2 first"\n'  # rec 5
+            + '"B2",S2,8,open,2024-01-02T03:04:05Z,"g2\nsecond"\n'  # rec 6
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 4)
+        body = findings[:-1]
+        self.assertEqual(
+            body,
+            [
+                ["conflict", ["A1", "S1"], [2, 3]],
+                ["duplicate", ["A1", "S1"], [2, 3]],
+                ["conflict", ["B2", "S2"], [5, 6]],
+                ["duplicate", ["B2", "S2"], [5, 6]],
+            ],
+        )
+
+    def test_multiline_group_without_conflict_reports_duplicate_only(self) -> None:
+        csv_text = (
+            HEADER
+            + 'A1,S1,3,open,2024-01-02T03:04:05Z,"same\nsame"\n'
+            + 'A1,S1,3,open,2024-01-02T03:04:05Z,"also\nsame"\n'
+        )
+        findings, n = self.audit(csv_text)
+        self.assertEqual(n, 2)
+        self.assertEqual(
+            findings[:-1], [["duplicate", ["A1", "S1"], [2, 3]]]
+        )
 
 
 class RunAuditFileTests(unittest.TestCase):

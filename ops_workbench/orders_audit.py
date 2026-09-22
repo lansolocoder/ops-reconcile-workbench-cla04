@@ -209,10 +209,15 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
     findings: list[list] = []
     groups: dict[tuple[str, str], list[tuple[int, int, str, str]]] = defaultdict(list)
     data_row_count = 0
+    # Logical record sequence numbers: the header is record 1, and every
+    # record the CSV parser yields afterwards increments the count by one.
+    # Newlines embedded inside quoted fields do not start a new record, so
+    # they do not increment it; blank and whitespace-only records do.
+    record_no = 1
 
     while True:
-        # The record starts on the physical line right after the previous
-        # record's last line (blank inter-record lines advance line_num too).
+        # Physical line where the next record begins; only used for the
+        # malformed-CSV diagnostic, whose wording stays line-based.
         start_line = reader.line_num + 1
         try:
             raw = next(reader)
@@ -221,11 +226,11 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
         except csv.Error as exc:
             raise AuditError(f"malformed CSV near line {start_line}: {exc}",
                              filename=input_name)
-        # Record numbers are physical line numbers; the header is record 1.
-        record_no = start_line
+        record_no += 1
 
         # A blank physical line parses to []; a line containing only
-        # whitespace yields a single whitespace cell. Neither is a data row.
+        # whitespace yields a single whitespace cell. Neither is a data row,
+        # but both still consume a logical record number.
         if not raw or (len(raw) == 1 and raw[0].strip() == ""):
             continue
         data_row_count += 1
@@ -269,18 +274,16 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
         if any(member[1:4] != first[1:4] for member in members[1:]):
             findings.append(["conflict", [oid, sku], record_numbers])
 
-    # Ordering of equal-record findings follows the order in which the spec
-    # introduces them: row errors precede group errors, and within a group
-    # "duplicate" is reported first with "conflict" added on top; fields use
-    # the fixed five-key order.
-    type_rank = {"invalid": 0, "duplicate": 1, "conflict": 2}
-    field_rank = {field: i for i, field in enumerate(FIELDS)}
-
+    # Findings sort by the smallest involved record number, then the literal
+    # type text ("conflict" < "duplicate" < "invalid" lexicographically, so a
+    # group's conflict precedes its duplicate) and finally the field text.
+    # Group findings carry no field, so they sort with the empty string; only
+    # invalid findings sharing the same record number and type are ordered by
+    # the logical field name.
     def sort_key(item: list) -> tuple:
-        # Smallest involved record number, then the literal type and field.
         if item[0] == "invalid":
-            return item[1], type_rank[item[0]], field_rank[item[2]]
-        return item[2][0], type_rank[item[0]], 0
+            return item[1], item[0], item[2]
+        return item[2][0], item[0], ""
 
     findings.sort(key=sort_key)
 
