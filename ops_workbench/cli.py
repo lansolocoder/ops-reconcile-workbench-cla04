@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from . import __version__
 from .decisions import DecisionConflictError, run_decide, run_review
 from .diff_audits import run_diff
+from .fixes import FixConflictError, run_apply_fixes, run_propose_fix
 from .orders_audit import AuditError, BatchConflictError, run_audit
 
 
@@ -141,6 +142,75 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the review here (atomically replaced); defaults to stdout",
     )
+
+    propose = subparsers.add_parser(
+        "propose-fix",
+        help="attach a validated correction patch to a fix decision",
+        description=(
+            "Propose a traceable correction (a non-empty JSON array of "
+            "[record, field, new value] triples) for one finding whose fix "
+            "decision is recorded on a stored batch."
+        ),
+    )
+    propose.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders --db/--batch",
+    )
+    propose.add_argument("batch", metavar="BATCH", help="id of the stored batch")
+    propose.add_argument(
+        "identity",
+        metavar="ID",
+        help=(
+            "JSON identity of the finding with a fix decision, e.g. "
+            '\'["invalid",2,"qty"]\''
+        ),
+    )
+    propose.add_argument(
+        "patch",
+        metavar="PATCH",
+        help=(
+            'non-empty JSON array of [record number, field, new value] '
+            "triples, e.g. '[[2,\"qty\",\"3\"]]'"
+        ),
+    )
+
+    apply = subparsers.add_parser(
+        "apply-fixes",
+        help="apply the proposed fixes of a source batch and trace the result",
+        description=(
+            "Apply every proposed correction of source batch SOURCE to an "
+            "INPUT CSV whose hash matches that batch, re-audit with the "
+            "source schema, write the corrected CSV and store a derived "
+            "batch DERIVED."
+        ),
+    )
+    apply.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders --db/--batch",
+    )
+    apply.add_argument(
+        "source", metavar="SOURCE", help="id of the source batch with fix proposals"
+    )
+    apply.add_argument(
+        "derived", metavar="DERIVED", help="id under which the derived batch is stored"
+    )
+    apply.add_argument("input", metavar="INPUT", help="CSV whose hash matches SOURCE")
+    apply.add_argument(
+        "--output",
+        required=True,
+        metavar="CSV",
+        help="write the corrected CSV here (atomically replaced)",
+    )
+    apply.add_argument(
+        "--report",
+        metavar="R",
+        default=None,
+        help="write the re-audit JSONL here (atomically replaced); defaults to stdout",
+    )
     return parser
 
 
@@ -213,6 +283,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             location = f"{exc.filename}: " if exc.filename else ""
             print(
                 f"ops-workbench review-decisions: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "propose-fix":
+        try:
+            return run_propose_fix(
+                args.db, args.batch, args.identity, args.patch
+            )
+        except FixConflictError as exc:
+            print(f"ops-workbench propose-fix: error: {exc}", file=sys.stderr)
+            return 3
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench propose-fix: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "apply-fixes":
+        try:
+            return run_apply_fixes(
+                args.db,
+                args.source,
+                args.derived,
+                args.input,
+                args.output,
+                args.report,
+            )
+        except FixConflictError as exc:
+            print(f"ops-workbench apply-fixes: error: {exc}", file=sys.stderr)
+            return 3
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench apply-fixes: error: {location}{exc.message}",
                 file=sys.stderr,
             )
             return 2
