@@ -5,7 +5,8 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from .orders_audit import AuditError, run_audit
+from .diff_audits import run_diff
+from .orders_audit import AuditError, BatchConflictError, run_audit
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the report here (atomically replaced); defaults to stdout",
     )
+    audit.add_argument(
+        "--db",
+        metavar="DB",
+        default=None,
+        help=(
+            "SQLite database used to trace audit batches; must be given "
+            "together with --batch"
+        ),
+    )
+    audit.add_argument(
+        "--batch",
+        metavar="ID",
+        default=None,
+        help=(
+            "store this run under batch ID in --db; an identical stored "
+            "batch is returned idempotently, a conflicting one exits 3"
+        ),
+    )
+
+    diff = subparsers.add_parser(
+        "diff-audits",
+        help="explain the finding differences between two stored batches",
+        description=(
+            "Compare the finding sets of batches OLD and NEW stored in the "
+            "--db SQLite database and emit added/resolved/changed items as "
+            "JSON Lines."
+        ),
+    )
+    diff.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders --db/--batch",
+    )
+    diff.add_argument("old", metavar="OLD", help="id of the older batch")
+    diff.add_argument("new", metavar="NEW", help="id of the newer batch")
+    diff.add_argument(
+        "--output",
+        metavar="O",
+        default=None,
+        help="write the diff here (atomically replaced); defaults to stdout",
+    )
     return parser
 
 
@@ -54,12 +97,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "audit-orders":
+        if (args.db is None) != (args.batch is None):
+            print(
+                "ops-workbench audit-orders: error: --db and --batch must be "
+                "given together",
+                file=sys.stderr,
+            )
+            return 2
         try:
-            return run_audit(args.schema, args.input, args.output)
+            return run_audit(
+                args.schema,
+                args.input,
+                args.output,
+                db_path=args.db,
+                batch_id=args.batch,
+            )
+        except BatchConflictError as exc:
+            print(f"ops-workbench audit-orders: error: {exc}", file=sys.stderr)
+            return 3
         except AuditError as exc:
             location = f"{exc.filename}: " if exc.filename else ""
             print(
                 f"ops-workbench audit-orders: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "diff-audits":
+        try:
+            return run_diff(args.db, args.old, args.new, args.output)
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench diff-audits: error: {location}{exc.message}",
                 file=sys.stderr,
             )
             return 2

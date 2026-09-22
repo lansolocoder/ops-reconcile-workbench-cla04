@@ -7,14 +7,17 @@ library is used.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import io
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from typing import BinaryIO, TextIO
 
@@ -38,6 +41,21 @@ class AuditError(Exception):
         super().__init__(message)
         self.message = message
         self.filename = filename
+
+
+class BatchConflictError(Exception):
+    """The batch id is already stored with different content (exit 3).
+
+    The database and any pre-existing output are left untouched.
+    """
+
+    def __init__(self, batch_id: str, differing: list[str]):
+        self.batch_id = batch_id
+        self.differing = differing
+        aspects = ", ".join(differing)
+        super().__init__(
+            f"batch {batch_id!r} is already stored with different {aspects}"
+        )
 
 
 def parse_schema(raw: str) -> dict[str, list[str]]:
@@ -299,27 +317,90 @@ def serialize(findings: list[list]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def run_audit(
-    schema_text: str,
-    input_path: str,
-    output_path: str | None = None,
-    stdout: BinaryIO | TextIO | None = None,
-) -> int:
-    """File-level wrapper: read INPUT, produce the report, return exit code.
+def _canonical_json(obj) -> str:
+    """Deterministic JSON text used to store and compare batch records."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-    Fatal problems raise :class:`AuditError`; the caller renders stderr.
-    The report is only emitted after the whole scan succeeds.
+
+# A stored batch: (SHA-256 of the raw input bytes, canonical JSON of the
+# parsed schema, canonical JSON of the finding set without the summary).
+_BATCH_COLUMNS = ("input_sha256", "schema_json", "findings_json")
+
+_CREATE_BATCHES_SQL = """
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id TEXT PRIMARY KEY,
+    input_sha256 TEXT NOT NULL,
+    schema_json TEXT NOT NULL,
+    findings_json TEXT NOT NULL
+)
+"""
+
+
+@contextlib.contextmanager
+def _batch_transaction(db_path: str) -> Iterator[sqlite3.Connection]:
+    """Hold one immediate SQLite transaction on the batch database.
+
+    Storage errors are reported as :class:`AuditError` (exit 2); anything
+    raised inside the block rolls the transaction back, so a failed run
+    never rewrites a batch.
     """
     try:
-        with open(input_path, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        raise AuditError(f"cannot read input file: {exc}", filename=input_path)
+        conn = sqlite3.connect(db_path)
+        conn.isolation_level = None  # explicit BEGIN/COMMIT below
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(_CREATE_BATCHES_SQL)
+    except sqlite3.Error as exc:
+        raise AuditError(f"cannot open database: {exc}", filename=db_path)
+    try:
+        try:
+            yield conn
+        except sqlite3.Error as exc:
+            raise AuditError(f"database error: {exc}", filename=db_path)
+        try:
+            conn.execute("COMMIT")
+        except sqlite3.Error as exc:
+            raise AuditError(f"cannot commit batch: {exc}", filename=db_path)
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
-    findings, _ = audit(data, schema_text, input_path)
-    payload = serialize(findings)
-    issue_count = len(findings) - 1  # the last item is the summary
 
+def _load_batch(conn: sqlite3.Connection, batch_id: str) -> tuple | None:
+    row = conn.execute(
+        "SELECT input_sha256, schema_json, findings_json "
+        "FROM batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+def fetch_batch(db_path: str, batch_id: str) -> tuple | None:
+    """Read one stored batch record, or ``None`` when it does not exist."""
+    if not os.path.isfile(db_path):
+        raise AuditError("database does not exist", filename=db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            return _load_batch(conn, batch_id)
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise AuditError(f"cannot read database: {exc}", filename=db_path)
+    except sqlite3.Error as exc:
+        raise AuditError(f"cannot read database: {exc}", filename=db_path)
+
+
+def emit_report(
+    payload: bytes,
+    output_path: str | None,
+    stdout: BinaryIO | TextIO | None,
+) -> None:
+    """Write a fully generated report to stdout or atomically to a file."""
     if output_path is None:
         if stdout is None:  # pragma: no cover - always injected by main
             import sys
@@ -337,7 +418,73 @@ def run_audit(
     else:
         _atomic_write(output_path, payload)
 
-    return 1 if issue_count else 0
+
+def run_audit(
+    schema_text: str,
+    input_path: str,
+    output_path: str | None = None,
+    stdout: BinaryIO | TextIO | None = None,
+    db_path: str | None = None,
+    batch_id: str | None = None,
+) -> int:
+    """File-level wrapper: read INPUT, produce the report, return exit code.
+
+    Fatal problems raise :class:`AuditError`; the caller renders stderr.
+    The report is only emitted after the whole scan succeeds.
+
+    With ``db_path``/``batch_id`` the completed scan is traced: the batch
+    id, input hash, parsed schema and finding set are stored in a single
+    SQLite transaction together with the report write.  Re-running an
+    identical batch is idempotent; a conflicting batch id raises
+    :class:`BatchConflictError` (exit 3) and leaves the database and any
+    old output untouched.
+    """
+    try:
+        with open(input_path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise AuditError(f"cannot read input file: {exc}", filename=input_path)
+
+    findings, _ = audit(data, schema_text, input_path)
+    payload = serialize(findings)
+    issue_count = len(findings) - 1  # the last item is the summary
+    exit_code = 1 if issue_count else 0
+
+    if db_path is None:
+        emit_report(payload, output_path, stdout)
+        return exit_code
+
+    record = (
+        hashlib.sha256(data).hexdigest(),
+        _canonical_json(parse_schema(schema_text)),
+        _canonical_json(findings[:-1]),
+    )
+    with _batch_transaction(db_path) as conn:
+        existing = _load_batch(conn, batch_id)
+        if existing is not None:
+            if existing != record:
+                differing = [
+                    aspect
+                    for aspect, stored, current in zip(
+                        ("input hash", "schema", "finding set"),
+                        existing,
+                        record,
+                    )
+                    if stored != current
+                ]
+                raise BatchConflictError(batch_id, differing)
+            # Identical record: idempotent, the database is not rewritten.
+        else:
+            conn.execute(
+                "INSERT INTO batches "
+                "(batch_id, input_sha256, schema_json, findings_json) "
+                "VALUES (?, ?, ?, ?)",
+                (batch_id, *record),
+            )
+        # The report write participates in the transaction: if it fails,
+        # the batch is rolled back with it.
+        emit_report(payload, output_path, stdout)
+    return exit_code
 
 
 def _atomic_write(path: str, payload: bytes) -> None:
