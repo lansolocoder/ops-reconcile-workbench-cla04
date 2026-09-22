@@ -210,9 +210,15 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
     groups: dict[tuple[str, str], list[tuple[int, int, str, str]]] = defaultdict(list)
     data_row_count = 0
 
+    # Logical record numbers as delivered by the CSV parser: the header is
+    # record 1 and every subsequent logical record increments the counter,
+    # including skipped blank records.  A quoted newline inside a field does
+    # NOT start a new record.
+    record_no = 1
+
     while True:
-        # The record starts on the physical line right after the previous
-        # record's last line (blank inter-record lines advance line_num too).
+        # Physical line the next record starts on (blank inter-record lines
+        # advance line_num too); used only for malformed-CSV diagnostics.
         start_line = reader.line_num + 1
         try:
             raw = next(reader)
@@ -221,8 +227,7 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
         except csv.Error as exc:
             raise AuditError(f"malformed CSV near line {start_line}: {exc}",
                              filename=input_name)
-        # Record numbers are physical line numbers; the header is record 1.
-        record_no = start_line
+        record_no += 1
 
         # A blank physical line parses to []; a line containing only
         # whitespace yields a single whitespace cell. Neither is a data row.
@@ -269,18 +274,16 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
         if any(member[1:4] != first[1:4] for member in members[1:]):
             findings.append(["conflict", [oid, sku], record_numbers])
 
-    # Ordering of equal-record findings follows the order in which the spec
-    # introduces them: row errors precede group errors, and within a group
-    # "duplicate" is reported first with "conflict" added on top; fields use
-    # the fixed five-key order.
-    type_rank = {"invalid": 0, "duplicate": 1, "conflict": 2}
-    field_rank = {field: i for i, field in enumerate(FIELDS)}
-
+    # Deterministic ordering: smallest involved logical record number, then
+    # the type text lexicographically ("conflict" < "duplicate" < "invalid"),
+    # then the logical field name.  Group findings carry no field, which is
+    # ordered as the empty string; invalid findings repeat at most once per
+    # field of one record, so ties beyond that do not occur and the stable
+    # sort keeps the scan order (first member ascending).
     def sort_key(item: list) -> tuple:
-        # Smallest involved record number, then the literal type and field.
         if item[0] == "invalid":
-            return item[1], type_rank[item[0]], field_rank[item[2]]
-        return item[2][0], type_rank[item[0]], 0
+            return item[1], item[0], item[2]
+        return item[2][0], item[0], ""
 
     findings.sort(key=sort_key)
 
