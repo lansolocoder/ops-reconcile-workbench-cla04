@@ -110,22 +110,22 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 def _fetch_fix_decisions(
     conn: sqlite3.Connection, batch_id: str
-) -> dict[tuple, tuple[str, str]]:
+) -> dict[tuple, tuple[str, str, str]]:
     """Return the batch's ``fix`` decisions keyed by identity tuple.
 
-    Each value is ``(reason, finding_json)``.  A database without a
+    Each value is ``(action, reason, finding_json)``.  A database without a
     decisions table simply has no decisions.
     """
     if not _table_exists(conn, "decisions"):
         return {}
     rows = conn.execute(
-        "SELECT identity_json, reason, finding_json FROM decisions "
+        "SELECT identity_json, action, reason, finding_json FROM decisions "
         "WHERE batch_id = ? AND action = 'fix'",
         (batch_id,),
     ).fetchall()
     return {
-        tuple(json.loads(identity_json)): (reason, finding_json)
-        for identity_json, reason, finding_json in rows
+        tuple(json.loads(identity_json)): (action, reason, finding_json)
+        for identity_json, action, reason, finding_json in rows
     }
 
 
@@ -321,7 +321,7 @@ def run_propose_fix(
                 f"no fix decision for identity {ident} in batch {batch_id!r}",
                 filename="ID",
             )
-        reason, decision_finding_json = decision
+        _action, reason, decision_finding_json = decision
 
         matches = [f for f in findings if tuple(finding_identity(f)) == ident_tuple]
         if not matches or _canonical_json(matches[0]) != decision_finding_json:
@@ -479,22 +479,25 @@ def _apply_patches(
 
 
 def _build_snapshot(
-    decisions: dict[tuple, tuple[str, str]],
+    decisions: dict[tuple, tuple[str, str, str]],
     proposals: dict[tuple, tuple[str, str]],
 ) -> list:
     """Identity-sorted traceability snapshot of decisions and proposals.
 
-    Every ``fix`` decision appears with its trimmed reason and the finding
-    it was recorded against; proposals additionally carry the stored
-    finding and the applied patch.
+    Every ``fix`` decision appears with its stored ``action``, trimmed
+    reason and the complete original finding the decision was bound to
+    (taken from the stored decision, never re-derived from the current
+    batch); proposals additionally carry the complete original finding and
+    the patch they were stored with.
     """
     snapshot = []
     for ident in sorted(decisions):
-        reason, finding_json = decisions[ident]
+        action, reason, decision_finding_json = decisions[ident]
         entry: dict = {
             "identity": list(ident),
+            "action": action,
             "reason": reason,
-            "finding": json.loads(finding_json),
+            "finding": json.loads(decision_finding_json),
         }
         proposal = proposals.get(ident)
         if proposal is not None:
@@ -527,51 +530,119 @@ def _stage_file(path: str, payload: bytes) -> str:
     return tmp_path
 
 
-def _emit_outputs(
-    report_payload: bytes,
-    report_path: str | None,
-    stdout: BinaryIO | TextIO | None,
-    csv_path: str,
-    csv_payload: bytes,
-) -> None:
-    """Emit the audit JSONL and atomically replace both output files.
+class _OutputCommitter:
+    """Stage, replace and (on failure) restore the file outputs.
 
-    File outputs are fully staged before either target is replaced, so a
-    failure leaves every pre-existing output in place and removes the
-    staged temp files.
+    Before anything is replaced, every target's original bytes and its
+    previous (non-)existence are captured.  All payloads are fully staged
+    first; only then are the targets replaced in order.  On any failure
+    the already-replaced targets are withdrawn again — pre-existing files
+    get their exact original bytes back via another atomic replace,
+    previously absent targets are removed — and every temporary file of
+    this run is cleaned up.  If the recovery itself fails, the raised
+    :class:`AuditError` reports both the original failure and the recovery
+    failure; success is never claimed.
     """
-    staged: list[tuple[str, str]] = []
-    try:
-        # Preflight the replace targets before touching either one: two
-        # renames cannot share one atomic step, so detect the common
-        # non-replaceable target (an existing directory) up front to keep
-        # every pre-existing output in place on failure.
-        for target in (csv_path, report_path):
-            if target is not None and os.path.isdir(target):
+
+    def __init__(self, outputs: list[tuple[str, bytes]]):
+        self.outputs = outputs
+        self.original: dict[str, bytes | None] = {}
+        self.existed: dict[str, bool] = {}
+        self.staged: dict[str, str] = {}
+        self.replaced: list[str] = []
+
+    def prepare(self) -> None:
+        """Capture every target's original bytes/existence; preflight dirs."""
+        for path, _payload in self.outputs:
+            if os.path.isdir(path):
                 raise AuditError(
-                    f"cannot write output: {target} is a directory",
-                    filename=target,
+                    f"cannot write output: {path} is a directory",
+                    filename=path,
                 )
-        csv_tmp = _stage_file(csv_path, csv_payload)
-        staged.append((csv_path, csv_tmp))
-        report_tmp: str | None = None
-        if report_path is not None:
-            report_tmp = _stage_file(report_path, report_payload)
-            staged.append((report_path, report_tmp))
-        else:
-            emit_report(report_payload, None, stdout)
+            try:
+                with open(path, "rb") as fh:
+                    self.original[path] = fh.read()
+            except FileNotFoundError:
+                self.original[path] = None
+                self.existed[path] = False
+            except OSError as exc:
+                raise AuditError(
+                    f"cannot read existing output: {exc}", filename=path
+                )
+            else:
+                self.existed[path] = True
+
+    def stage_all(self) -> None:
+        """Fully stage every payload; nothing is replaced at this point."""
+        for path, payload in self.outputs:
+            self.staged[path] = _stage_file(path, payload)
+
+    def replace_all(self) -> None:
+        """Replace the targets in order once every payload is staged.
+
+        Targets already replaced stay recorded in ``self.replaced`` so the
+        caller's abort can withdraw them even when a later replace fails.
+        """
         try:
-            if report_tmp is not None:
-                os.replace(report_tmp, report_path)
-            os.replace(csv_tmp, csv_path)
+            for path, _payload in self.outputs:
+                os.replace(self.staged[path], path)
+                self.replaced.append(path)
         except OSError as exc:
-            failed = report_path if report_tmp is not None else csv_path
-            raise AuditError(f"cannot write output: {exc}", filename=failed)
-        staged.clear()
-    finally:
-        for _target, tmp in staged:
+            raise AuditError(f"cannot write output: {exc}", filename=path)
+
+    def _restore(self) -> list[tuple[str, str]]:
+        """Withdraw successful replacements; return per-target restore errors."""
+        errors: list[tuple[str, str]] = []
+        for path in reversed(self.replaced):
+            try:
+                if self.existed.get(path):
+                    tmp_path = _stage_file(path, self.original[path])
+                    try:
+                        os.replace(tmp_path, path)
+                    except OSError:
+                        with contextlib.suppress(OSError):
+                            os.unlink(tmp_path)
+                        raise
+                else:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            except Exception as exc:  # noqa: BLE001 - every recovery error counts
+                errors.append((path, _describe_error(exc)))
+        return errors
+
+    def _cleanup_staged(self) -> None:
+        for tmp_path in self.staged.values():
             with contextlib.suppress(OSError):
-                os.unlink(tmp)
+                os.unlink(tmp_path)
+
+    def abort(self, original: BaseException) -> None:
+        """Roll the files back to their captured state and clean temps.
+
+        Returns normally when recovery succeeds (the caller then re-raises
+        ``original`` itself); when the recovery itself fails it raises a
+        combined :class:`AuditError` describing both the original failure
+        and the recovery failure, so success is never claimed.
+        """
+        restore_errors = self._restore()
+        self._cleanup_staged()
+        if not restore_errors:
+            return
+        detail = "; ".join(f"{path}: {text}" for path, text in restore_errors)
+        message = (
+            f"{_describe_error(original)}; additionally, output recovery "
+            "failed and some outputs may not be back to their previous "
+            f"state: {detail}"
+        )
+        raise AuditError(message)
+
+
+def _describe_error(exc: BaseException) -> str:
+    if isinstance(exc, AuditError):
+        location = f"{exc.filename}: " if exc.filename else ""
+        return f"{location}{exc.message}"
+    return str(exc) or repr(exc)
 
 
 def run_apply_fixes(
@@ -587,17 +658,29 @@ def run_apply_fixes(
 
     INPUT's SHA-256 must equal the source batch hash.  Every ``fix``
     decision of the source batch must have a proposal whose stored finding
-    still matches.  Proposals are applied ordered by identity, record
-    number and field, then the corrected CSV is re-audited with the source
-    schema.  The audit JSONL goes to stdout or ``--report R``; the corrected
-    CSV is atomically written to ``--output``.  A derived batch tracing the
-    new hash, schema, findings, source and a decision/proposal snapshot is
-    stored in one transaction together with the file writes.  Repeating the
-    same derived id with identical content is idempotent (exit 0);
-    different content raises :class:`FixConflictError` (exit 3).  Any stale
-    decision, illegal patch, I/O, database or audit error raises
-    :class:`AuditError` (exit 2); the database, the derived batch and any
-    old output are left untouched and temporary files are cleaned up.
+    (and whose decision's stored finding) still matches.  Changes are
+    executed in one global order — finding identity ascending, then record
+    number, then the logical field text.  A single proposal may not repeat
+    a target, but different findings may modify the same cell; within such
+    a cell the later-executed value overrides the earlier one and that
+    value is what the corrected CSV, the re-audit and the derived batch
+    use.  The audit JSONL goes to stdout or ``--report R``; the corrected
+    CSV is written to ``--output``.  A derived batch tracing the new hash,
+    schema, findings, source and an identity-sorted decision/proposal
+    snapshot (each entry carrying the decision's action, trimmed reason and
+    the complete original findings it and its proposal were bound to) is
+    stored in one transaction.  Repeating the same derived id with
+    identical content is idempotent (exit 0, outputs regenerated);
+    different content raises :class:`FixConflictError` (exit 3).
+
+    Before any output is replaced, each target's original bytes and
+    previous (non-)existence are captured; any staging, replacement or
+    transaction commit failure exits 2, rolls the derived batch back and
+    restores both outputs to their pre-call bytes or absence — including
+    withdrawing an output that was already replaced.  Temporary files and
+    backups are cleaned up.  If the recovery itself fails, the error
+    reports both the original and the recovery failure; success is never
+    claimed.  INPUT is never modified.
     """
     try:
         with open(input_path, "rb") as fh:
@@ -620,115 +703,143 @@ def run_apply_fixes(
     text, header = _decode_csv(data, input_path)
     columns = resolve_columns(schema, header)
 
-    # Everything database- or output-related happens in one transaction,
-    # exactly like audit-orders --db/--batch: a failed write rolls the
-    # derived batch back and leaves old outputs in place.
-    with _fix_transaction(db_path) as conn:
-        decisions = _fetch_fix_decisions(conn, source_id)
-        proposals = _fetch_proposals(conn, source_id)
+    # Everything database-related happens in one transaction; the file
+    # outputs are staged and replaced while that transaction is open.  The
+    # original bytes (or previous absence) of every output target are
+    # captured before any replacement, so any later failure rolls the
+    # derived batch back AND withdraws every replaced output.
+    committer: _OutputCommitter | None = None
+    try:
+        with _fix_transaction(db_path) as conn:
+            decisions = _fetch_fix_decisions(conn, source_id)
+            proposals = _fetch_proposals(conn, source_id)
 
-        missing = sorted(set(decisions) - set(proposals))
-        if missing:
-            raise AuditError(
-                f"fix decision for identity {_ident_text(missing[0])} in batch "
-                f"{source_id!r} has no proposal",
-                filename=db_path,
-            )
+            missing = sorted(set(decisions) - set(proposals))
+            if missing:
+                raise AuditError(
+                    f"fix decision for identity {_ident_text(missing[0])} in "
+                    f"batch {source_id!r} has no proposal",
+                    filename=db_path,
+                )
 
-        # Identity ordering first; within one finding the patch triples
-        # sort by record number then the logical field order.
-        ordered_changes: dict[tuple[int, str], str] = {}
-        for ident in sorted(proposals):
-            if ident not in decisions:
-                raise AuditError(
-                    f"stored proposal for identity {_ident_text(ident)} has no "
-                    f"fix decision in batch {source_id!r}",
-                    filename=db_path,
-                )
-            decision_finding_json = decisions[ident][1]
-            finding_json, patch_json = proposals[ident]
-            matches = [
-                f for f in source_findings
-                if tuple(finding_identity(f)) == ident
-            ]
-            current_finding_json = (
-                _canonical_json(matches[0]) if matches else None
-            )
-            if current_finding_json is None:
-                raise AuditError(
-                    f"identity {_ident_text(ident)} no longer appears in batch "
-                    f"{source_id!r}; the fix decision and proposal are stale",
-                    filename=db_path,
-                )
-            if current_finding_json != decision_finding_json:
-                raise AuditError(
-                    f"fix decision for identity {_ident_text(ident)} no longer "
-                    f"matches the finding stored in batch {source_id!r}",
-                    filename=db_path,
-                )
-            if current_finding_json != finding_json:
-                raise AuditError(
-                    f"proposal for identity {_ident_text(ident)} no longer "
-                    f"matches a finding of batch {source_id!r}",
-                    filename=db_path,
-                )
-            finding = matches[0]
-            patch = json.loads(patch_json)
-            _validate_patch_against_finding(patch, ident, finding)
-            for recno, field, new_value in sorted(
-                patch, key=lambda t: (t[0], FIELDS.index(t[1]))
-            ):
-                key = (recno, field)
-                if key in ordered_changes:
+            # All changes are executed in one global order: finding
+            # identity ascending (element by element), then record number,
+            # then the logical field *text*.  A single patch still may not
+            # repeat a target, but different findings may modify the same
+            # cell; within that cell a later execution overrides an earlier
+            # one, so the final CSV, the re-audit and the derived batch all
+            # see the last value.
+            ordered_changes: dict[tuple[int, str], str] = {}
+            for ident in sorted(proposals):
+                if ident not in decisions:
                     raise AuditError(
-                        f"proposals target cell ({recno}, {field!r}) more than "
-                        "once across findings",
-                        filename="PATCH",
+                        f"stored proposal for identity {_ident_text(ident)} has "
+                        f"no fix decision in batch {source_id!r}",
+                        filename=db_path,
                     )
-                ordered_changes[key] = new_value
-
-        corrected_text = _apply_patches(
-            text, len(header), columns, ordered_changes, input_path
-        )
-        corrected_bytes = corrected_text.encode("utf-8")
-
-        findings, _ = audit(
-            corrected_bytes, json.dumps(schema), "<corrected csv>"
-        )
-        payload = serialize(findings)
-
-        snapshot = _build_snapshot(decisions, proposals)
-        derived_record = (
-            hashlib.sha256(corrected_bytes).hexdigest(),
-            _canonical_json(schema),
-            _canonical_json(findings[:-1]),
-            source_id,
-            _canonical_json(snapshot),
-        )
-
-        existing = conn.execute(
-            "SELECT input_sha256, schema_json, findings_json, source_batch_id, "
-            "snapshot_json FROM derived_batches WHERE derived_id = ?",
-            (derived_id,),
-        ).fetchone()
-        if existing is not None:
-            if tuple(existing) != derived_record:
-                raise FixConflictError(
-                    f"derived batch {derived_id!r} is already stored with "
-                    "different content"
+                _action, _reason, decision_finding_json = decisions[ident]
+                finding_json, patch_json = proposals[ident]
+                matches = [
+                    f for f in source_findings
+                    if tuple(finding_identity(f)) == ident
+                ]
+                current_finding_json = (
+                    _canonical_json(matches[0]) if matches else None
                 )
-            # Identical derived batch: idempotent; outputs are still emitted.
-        else:
-            conn.execute(
-                "INSERT INTO derived_batches "
-                "(derived_id, input_sha256, schema_json, findings_json, "
-                "source_batch_id, snapshot_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (derived_id, *derived_record),
+                if current_finding_json is None:
+                    raise AuditError(
+                        f"identity {_ident_text(ident)} no longer appears in "
+                        f"batch {source_id!r}; the fix decision and proposal "
+                        "are stale",
+                        filename=db_path,
+                    )
+                if current_finding_json != decision_finding_json:
+                    raise AuditError(
+                        f"fix decision for identity {_ident_text(ident)} no "
+                        f"longer matches the finding stored in batch "
+                        f"{source_id!r}",
+                        filename=db_path,
+                    )
+                if current_finding_json != finding_json:
+                    raise AuditError(
+                        f"proposal for identity {_ident_text(ident)} no longer "
+                        f"matches a finding of batch {source_id!r}",
+                        filename=db_path,
+                    )
+                finding = matches[0]
+                patch = json.loads(patch_json)
+                _validate_patch_against_finding(patch, ident, finding)
+                for recno, field, new_value in sorted(
+                    patch, key=lambda triple: (triple[0], triple[1])
+                ):
+                    # Last writer wins: another finding may have set this
+                    # same cell earlier in the execution order.
+                    ordered_changes[(recno, field)] = new_value
+
+            corrected_text = _apply_patches(
+                text, len(header), columns, ordered_changes, input_path
+            )
+            corrected_bytes = corrected_text.encode("utf-8")
+
+            findings, _ = audit(
+                corrected_bytes, json.dumps(schema), "<corrected csv>"
+            )
+            payload = serialize(findings)
+
+            snapshot = _build_snapshot(decisions, proposals)
+            derived_record = (
+                hashlib.sha256(corrected_bytes).hexdigest(),
+                _canonical_json(schema),
+                _canonical_json(findings[:-1]),
+                source_id,
+                _canonical_json(snapshot),
             )
 
-        # Both output writes participate in the transaction: file outputs
-        # are fully staged before either atomic replace, so a failure rolls
-        # the derived batch back and leaves old outputs untouched.
-        _emit_outputs(payload, report_path, stdout, output_path, corrected_bytes)
+            existing = conn.execute(
+                "SELECT input_sha256, schema_json, findings_json, "
+                "source_batch_id, snapshot_json FROM derived_batches "
+                "WHERE derived_id = ?",
+                (derived_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != derived_record:
+                    raise FixConflictError(
+                        f"derived batch {derived_id!r} is already stored with "
+                        "different content"
+                    )
+                # Identical derived batch: idempotent; outputs are still
+                # regenerated below.
+            else:
+                conn.execute(
+                    "INSERT INTO derived_batches "
+                    "(derived_id, input_sha256, schema_json, findings_json, "
+                    "source_batch_id, snapshot_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (derived_id, *derived_record),
+                )
+
+            # Capture the previous state of every file target before
+            # anything is staged or replaced.
+            file_outputs = [(output_path, corrected_bytes)]
+            if report_path is not None:
+                file_outputs.append((report_path, payload))
+            committer = _OutputCommitter(file_outputs)
+            committer.prepare()
+            committer.stage_all()
+            # A stdout report participates in the same failure envelope as
+            # the files: a failed write rolls the batch back.
+            if report_path is None:
+                emit_report(payload, None, stdout)
+            # Both files are fully staged; only now are they replaced, in
+            # order.  Leaving the with-block commits the transaction.  Any
+            # failure is handled below by rollback plus output recovery.
+            committer.replace_all()
+    except BaseException as exc:
+        if committer is not None:
+            # Rolls the files back to their captured state; if that recovery
+            # itself fails, abort raises a combined error instead of the
+            # original, so both failures reach stderr and success is never
+            # claimed.
+            committer.abort(exc)
+        raise
     return 0
