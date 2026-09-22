@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from . import __version__
 from .adjust_stock import run_adjust_stock
+from .replay_stock import run_replay_stock
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -27,6 +28,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     adjust_parser.add_argument("adjustments", help="UTF-8 CSV adjustments path")
     adjust_parser.add_argument("report", help="output JSON report path")
     adjust_parser.set_defaults(handler=run_adjust_stock)
+
+    replay_parser = subparsers.add_parser(
+        "replay-stock",
+        help="merge adjustments onto a trusted JSON stock report",
+        description=(
+            "Validate a base stock report (adjust-stock or replay-stock "
+            "output) and an adjustments CSV, skip already-recorded ids, "
+            "apply the remaining adjustments as one atomic batch, and "
+            "write a JSON report."
+        ),
+    )
+    replay_parser.add_argument("base", help="trusted base JSON report path")
+    replay_parser.add_argument("adjustments", help="UTF-8 CSV adjustments path")
+    replay_parser.add_argument("report", help="output JSON report path")
+    replay_parser.set_defaults(handler=run_replay_stock)
 
     args = parser.parse_args(argv)
     handler = getattr(args, "handler", None)

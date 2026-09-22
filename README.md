@@ -8,6 +8,7 @@
 python3 -m ops_workbench --help
 python3 -m ops_workbench --version
 python3 -m ops_workbench adjust-stock SNAPSHOT ADJUSTMENTS REPORT
+python3 -m ops_workbench replay-stock BASE ADJUSTMENTS REPORT
 python3 -m unittest discover -s tests -v
 ```
 
@@ -16,6 +17,9 @@ python3 -m unittest discover -s tests -v
 - 无参数：显示总帮助（列出全部命令）；未知参数以非零状态退出。
 - `adjust-stock SNAPSHOT ADJUSTMENTS REPORT`：读取快照与调整两个 UTF-8 CSV，
   将全部调整作为一个原子批次应用，并写出 JSON 报告。
+- `replay-stock BASE ADJUSTMENTS REPORT`：以 `adjust-stock` 或
+  `replay-stock` 写出的 JSON 报告（BASE）为可信库存起点，合并调整 CSV 并
+  写出新的 JSON 报告。
 
 ## adjust-stock 输入格式
 
@@ -45,3 +49,39 @@ python3 -m unittest discover -s tests -v
 成功时原子替换 `REPORT` 且终端无输出；`REPORT` 不得与任一输入文件同路径。
 输入无效或规则冲突时以非零状态退出，stderr 含文件名、数据行号与原因，
 且已有的旧报告保持不变。
+
+## replay-stock 输入格式
+
+BASE 为 `adjust-stock` 或 `replay-stock` 的 JSON 输出，须符合现有输出契约：
+
+- `stock`、`audit` 字段及类型与 `adjust-stock` 输出一致；业务键
+  `(warehouse, sku)` 与 audit `id` 各自唯一；数值为 JSON 整数，时间为
+  UTC `Z`。库存以 `stock` 为准，不从 `audit` 反算。
+- 可选 `batches`：互异的 64 位小写十六进制字符串数组（调整文件原始字节的
+  SHA-256 摘要）。
+
+ADJUSTMENTS 沿用现有调整 CSV 契约。按该契约规范化后：
+
+- 调整 `id` 若已在 BASE 的 `audit` 中：七个原输入字段
+  （`id, warehouse, sku, expected, delta, reason, occurred_at`）全同则
+  跳过；任一不同则整批失败。
+- 其余行按 `occurred_at` 的 UTC 时刻升序、同时刻按 `id` 升序应用：
+  业务键须存在于 BASE.stock；时刻不得早于该键当前 `updated_at`；
+  `expected` 必须等于应用前库存；应用后库存不得为负。
+
+## replay-stock 输出
+
+`REPORT` 为 JSON 对象，含 `stock`、`audit` 与 `batches`：
+
+- `stock`：按 `(warehouse, sku)` 排序，字段同 `adjust-stock`。
+- `audit`：保持 BASE.audit 的原顺序，并在末尾追加本次应用项（含 `before`、
+  `after`）；跳过的已存在 id 不重复出现。
+- `batches`：保留 BASE.batches 原值，仅在摘要不存在时追加 ADJUSTMENTS
+  原始字节的 SHA-256 小写值。
+- 重复提交同一批（摘要已在 `batches`）不得改变库存，也不增加 audit、
+  batches 条目。
+
+数值均为 JSON 整数；所有时间以 UTC `Z` 输出。成功时原子替换 `REPORT` 且
+终端无输出；`REPORT` 不得与任一输入文件同路径。BASE 无效、id 冲突或应用
+失败时以非零状态退出，stderr 含文件名、适用 CSV 数据行号与原因，且已有
+的旧报告保持不变。
