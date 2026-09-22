@@ -48,4 +48,34 @@ python3 -m ops_workbench diff-audits --db batches.db OLD NEW [--output O]
 - 结果按身份逐项升序，末行为 `["summary",added数,resolved数,changed数,OLD哈希,NEW哈希]`。
 - 成功退出 0；数据库或批次不存在退出 2（原因写入 stderr，不产生部分结果）。默认写 stdout；指定 `--output O` 时沿用原子替换保护。
 
+## decide
+
+对一个已存批次的发现记录人工处置：
+
+```bash
+python3 -m ops_workbench decide --db batches.db BATCH ID ACTION REASON
+```
+
+- `BATCH`：已存批次 ID；`ID` 为 `diff-audits` 身份 JSON（如 `'["invalid",2,"qty"]'`），且必须命中该批次的一条发现。
+- `ACTION` 仅可为 `confirm`、`ignore`、`fix`；`REASON` 修剪后保存，修剪后为空则拒绝。
+- 决定（动作、原因）与命中的完整发现在**单事务**中写入新建的 `decisions` 表。
+- 重复保存完全相同的决定幂等退出 0；同身份但动作、原因或完整发现不同退出 3，已有记录不变；批次/身份不存在或参数错误退出 2，不改记录。
+
+## review-decisions
+
+复查一个批次（OLD）上的人工决定在另一个批次（NEW）中是否仍然成立：
+
+```bash
+python3 -m ops_workbench review-decisions --db batches.db OLD NEW [--output O]
+```
+
+`D` 表示 `[ACTION,REASON]`：
+
+- OLD 决定的身份仍命中且完整发现在 NEW 中未变：输出 `["kept",身份,D,NEW发现]`。
+- 同身份但完整发现改变：输出 `["invalid",身份,"changed",D,OLD发现,NEW发现]`，该身份同时按 pending 再输出一次。
+- 身份在 NEW 中消失：输出 `["invalid",身份,"resolved",D,OLD发现,null]`。
+- NEW 中没有 kept 决定的每条发现输出 `["pending",身份,NEW发现]`。
+- 结果按身份逐项升序；同一身份的 `invalid` 行排在 `pending` 行之前；末行为 `["summary",kept数,invalid数,pending数,OLD哈希,NEW哈希]`。
+- 所有数据库读取完成后才写出：读取或写出失败退出 2 且无部分结果。默认写 stdout；指定 `--output O` 时报告完整生成后原子替换 `O`，失败时保留旧文件。
+
 仅使用 Python 标准库，不会创建业务数据文件。
