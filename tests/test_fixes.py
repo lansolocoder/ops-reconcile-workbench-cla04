@@ -3,18 +3,21 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from ops_workbench.fixes import (
     FixConflictError,
     run_apply_fixes,
     run_propose_fix,
 )
+from ops_workbench import fixes as fixes_mod
 from ops_workbench.orders_audit import AuditError, run_audit
 from ops_workbench.decisions import run_decide
 
@@ -513,6 +516,292 @@ class ApplyFixesTests(ApplyFixture):
         )
         self.assertEqual(bad.returncode, 2)
         self.assertIn("hash", bad.stderr)
+
+
+class MergeAndRecoveryTests(unittest.TestCase):
+    """Overlap merge ordering, snapshot content and output rollback."""
+
+    CONFLICT_ID = '["conflict","A1","S1"]'
+    DUP_ID = '["duplicate","A1","S1"]'
+
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        base = Path(self.dir.name)
+        # Same oid/sku with a differing qty yields BOTH a duplicate and a
+        # conflict finding over records 2 and 3, so two distinct findings
+        # can legitimately target the same cell.
+        self.csv_text = (
+            "oid,sku,qty,status,updated_at\n"
+            + f"A1,S1,2,open,{TS}\n"
+            + f"A1,S1,7,open,{TS}\n"
+        )
+        self.input = base / "orders.csv"
+        self.input.write_text(self.csv_text)
+        self.db = str(base / "b.db")
+        self.assertEqual(
+            run_audit(SCHEMA, str(self.input), stdout=io.BytesIO(),
+                      db_path=self.db, batch_id="s"),
+            1,
+        )
+
+    def _propose_overlapping(self) -> None:
+        # "conflict" sorts before "duplicate"; both write record 3's qty,
+        # so only last-writer-wins by identity order can succeed.
+        self.assertEqual(
+            run_decide(self.db, "s", self.CONFLICT_ID, "fix", "  c  "), 0
+        )
+        self.assertEqual(
+            run_decide(self.db, "s", self.DUP_ID, "fix", "d"), 0
+        )
+        self.assertEqual(
+            run_propose_fix(self.db, "s", self.CONFLICT_ID,
+                            '[[3,"qty","8"]]'), 0
+        )
+        self.assertEqual(
+            run_propose_fix(self.db, "s", self.DUP_ID,
+                            '[[3,"qty","9"],[2,"sku","S2"]]'), 0
+        )
+
+    def test_overlapping_findings_last_value_wins_by_identity_order(self) -> None:
+        self._propose_overlapping()
+        output = str(Path(self.dir.name) / "fixed.csv")
+        code = run_apply_fixes(
+            self.db, "s", "der", str(self.input), output
+        )
+        self.assertEqual(code, 0)
+        rows = Path(output).read_text().splitlines()
+        # conflict (8) is overwritten by duplicate (9) on the shared cell.
+        self.assertEqual(rows[1], f"A1,S2,2,open,{TS}")
+        self.assertEqual(rows[2], f"A1,S1,9,open,{TS}")
+
+    def test_final_value_governs_reaudit_hash_and_snapshot(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        self.assertEqual(
+            run_apply_fixes(
+                self.db, "s", "der", str(self.input), str(output),
+                report_path=str(report),
+            ),
+            0,
+        )
+        lines = parse_lines(report.read_text())
+        # The merged correction fully resolves the group.
+        self.assertEqual(lines[-1], [
+            "summary", 2, 0,
+            hashlib.sha256(output.read_bytes()).hexdigest(),
+        ])
+        conn = sqlite3.connect(self.db)
+        try:
+            digest, snapshot_json = conn.execute(
+                "SELECT input_sha256, snapshot_json FROM derived_batches "
+                "WHERE derived_id = 'der'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(
+            digest, hashlib.sha256(output.read_bytes()).hexdigest()
+        )
+        snapshot = json.loads(snapshot_json)
+        self.assertEqual(
+            [e["identity"] for e in snapshot],
+            [["conflict", "A1", "S1"], ["duplicate", "A1", "S1"]],
+        )
+        for entry in snapshot:
+            self.assertEqual(entry["action"], "fix")
+        self.assertEqual(snapshot[0]["reason"], "c")  # trimmed
+        self.assertEqual(
+            snapshot[0]["finding"], ["conflict", ["A1", "S1"], [2, 3]]
+        )
+        self.assertEqual(
+            snapshot[0]["proposal"],
+            {"finding": ["conflict", ["A1", "S1"], [2, 3]],
+             "patch": [[3, "qty", "8"]]},
+        )
+        self.assertEqual(
+            snapshot[1]["proposal"]["finding"],
+            ["duplicate", ["A1", "S1"], [2, 3]],
+        )
+        self.assertEqual(
+            snapshot[1]["proposal"]["patch"], [[3, "qty", "9"], [2, "sku", "S2"]]
+        )
+
+    def test_within_finding_triples_run_by_field_text_not_field_order(self) -> None:
+        run_decide(self.db, "s", self.DUP_ID, "fix", "d")
+        # Stored order: sku before qty; logical FIELDS order is sku before
+        # qty too, but field *text* ascending is qty before sku.
+        run_propose_fix(
+            self.db, "s", self.DUP_ID, '[[2,"sku","S5"],[2,"qty","3"]]'
+        )
+        run_decide(self.db, "s", self.CONFLICT_ID, "fix", "c")
+        run_propose_fix(self.db, "s", self.CONFLICT_ID, '[[3,"qty","8"]]')
+        seen: list[tuple] = []
+        real_apply = fixes_mod._apply_patches
+
+        def spy(text, width, columns, changes, name):
+            seen.extend(changes)
+            return real_apply(text, width, columns, changes, name)
+
+        output = str(Path(self.dir.name) / "spied.csv")
+        with patch.object(fixes_mod, "_apply_patches", spy):
+            self.assertEqual(
+                run_apply_fixes(
+                    self.db, "s", "der", str(self.input), output
+                ),
+                0,
+            )
+        # conflict identity first (record 3 qty), then duplicate's record 2
+        # triples in field-text order: qty < sku.
+        self.assertEqual(
+            seen,
+            [(3, "qty"), (2, "qty"), (2, "sku")],
+        )
+
+    def _patch_replace_failing_csv_once(self):
+        """Return a patcher making the staged CSV replace fail once."""
+        real_replace = fixes_mod.os.replace
+
+        def flaky(src, dst, *args, **kwargs):
+            name = os.path.basename(str(src))
+            if (
+                str(dst).endswith("fixed.csv")
+                and name.endswith(".tmp")
+                and ".restore." not in name
+            ):
+                raise OSError("simulated csv replace failure")
+            return real_replace(src, dst, *args, **kwargs)
+
+        return patch.object(fixes_mod.os, "replace", flaky)
+
+    def test_replace_failure_restores_already_replaced_report(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        output.write_text("OLD CSV")
+        report.write_text("OLD REPORT")
+        with self._patch_replace_failing_csv_once(), self.assertRaises(AuditError):
+            run_apply_fixes(
+                self.db, "s", "der", str(self.input), str(output),
+                report_path=str(report),
+            )
+        self.assertEqual(output.read_text(), "OLD CSV")
+        self.assertEqual(report.read_text(), "OLD REPORT")
+        self.assertEqual(self._derived_count("der"), 0)
+        self.assertFalse(
+            [p.name for p in Path(self.dir.name).iterdir()
+             if p.name.endswith(".tmp")]
+        )
+
+    def test_replace_failure_removes_outputs_that_did_not_exist(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        with self._patch_replace_failing_csv_once(), self.assertRaises(AuditError):
+            run_apply_fixes(
+                self.db, "s", "der", str(self.input), str(output),
+                report_path=str(report),
+            )
+        # The report was newly created, then had to be withdrawn; the CSV
+        # never landed.
+        self.assertFalse(output.exists())
+        self.assertFalse(report.exists())
+
+    def test_restore_failure_is_reported_with_original_failure(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        output.write_text("OLD CSV")
+        report.write_text("OLD REPORT")
+        real_replace = fixes_mod.os.replace
+
+        def flaky(src, dst, *args, **kwargs):
+            name = os.path.basename(str(src))
+            if str(dst) == str(output) and ".restore." not in name:
+                raise OSError("primary replace failure")
+            if ".restore." in name:
+                raise OSError("restore failure")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with patch.object(fixes_mod.os, "replace", flaky):
+            with self.assertRaises(AuditError) as ctx:
+                run_apply_fixes(
+                    self.db, "s", "der", str(self.input), str(output),
+                    report_path=str(report),
+                )
+        self.assertIn("primary replace failure", ctx.exception.message)
+        self.assertIn("restore", ctx.exception.message)
+
+    def test_commit_failure_restores_both_outputs_and_rolls_back(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        output.write_text("OLD CSV")
+        report.write_text("OLD REPORT")
+
+        class FailingCommitConn(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("simulated commit failure")
+                return super().execute(sql, *args, **kwargs)
+
+        real_connect = fixes_mod.sqlite3.connect
+        with patch.object(
+            fixes_mod.sqlite3, "connect",
+            lambda *a, **k: real_connect(*a, factory=FailingCommitConn, **k),
+        ):
+            with self.assertRaises(AuditError) as ctx:
+                run_apply_fixes(
+                    self.db, "s", "der", str(self.input), str(output),
+                    report_path=str(report),
+                )
+        self.assertIn("commit", ctx.exception.message)
+        self.assertEqual(output.read_text(), "OLD CSV")
+        self.assertEqual(report.read_text(), "OLD REPORT")
+        self.assertEqual(self._derived_count("der"), 0)
+
+    def test_staging_failure_before_any_replace_leaves_outputs(self) -> None:
+        self._propose_overlapping()
+        output = Path(self.dir.name) / "fixed.csv"
+        report = Path(self.dir.name) / "report.jsonl"
+        output.write_text("OLD CSV")
+        report.write_text("OLD REPORT")
+
+        def fail_stage(path, payload):
+            raise AuditError("simulated stage failure", filename=path)
+
+        with patch.object(fixes_mod, "_stage_file", fail_stage), \
+                self.assertRaises(AuditError):
+            run_apply_fixes(
+                self.db, "s", "der", str(self.input), str(output),
+                report_path=str(report),
+            )
+        self.assertEqual(output.read_text(), "OLD CSV")
+        self.assertEqual(report.read_text(), "OLD REPORT")
+        self.assertEqual(self._derived_count("der"), 0)
+
+    def _derived_count(self, derived_id: str) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM derived_batches WHERE derived_id = ?",
+                (derived_id,),
+            ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return 0
+            raise
+        finally:
+            conn.close()
+
+    def test_input_file_is_never_modified(self) -> None:
+        self._propose_overlapping()
+        before = self.input.read_bytes()
+        output = str(Path(self.dir.name) / "fixed.csv")
+        self.assertEqual(
+            run_apply_fixes(self.db, "s", "der", str(self.input), output), 0
+        )
+        self.assertEqual(self.input.read_bytes(), before)
 
 
 if __name__ == "__main__":
