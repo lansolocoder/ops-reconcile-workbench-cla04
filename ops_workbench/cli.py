@@ -5,6 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
+from .decisions import DecisionConflictError, run_decide, run_review
 from .diff_audits import run_diff
 from .orders_audit import AuditError, BatchConflictError, run_audit
 
@@ -85,6 +86,61 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the diff here (atomically replaced); defaults to stdout",
     )
+
+    decide = subparsers.add_parser(
+        "decide",
+        help="record a manual disposition for one finding of a stored batch",
+        description=(
+            "Attach a human decision (confirm, ignore or fix with a reason) "
+            "to one finding of a batch stored by audit-orders --db/--batch."
+        ),
+    )
+    decide.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders --db/--batch",
+    )
+    decide.add_argument("batch", metavar="BATCH", help="id of the stored batch")
+    decide.add_argument(
+        "identity",
+        metavar="ID",
+        help=(
+            "JSON identity of the finding as used by diff-audits, e.g. "
+            '\'["invalid",2,"qty"]\''
+        ),
+    )
+    decide.add_argument(
+        "action",
+        metavar="ACTION",
+        choices=("confirm", "ignore", "fix"),
+        help="manual disposition: confirm, ignore or fix",
+    )
+    decide.add_argument("reason", metavar="REASON", help="non-empty reason text")
+
+    review = subparsers.add_parser(
+        "review-decisions",
+        help="replay the decisions of batch OLD against batch NEW",
+        description=(
+            "Review which manual decisions recorded for batch OLD still hold "
+            "against the findings of batch NEW and emit kept/invalid/pending "
+            "items as JSON Lines."
+        ),
+    )
+    review.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders --db/--batch",
+    )
+    review.add_argument("old", metavar="OLD", help="id of the batch with decisions")
+    review.add_argument("new", metavar="NEW", help="id of the batch to review against")
+    review.add_argument(
+        "--output",
+        metavar="O",
+        default=None,
+        help="write the review here (atomically replaced); defaults to stdout",
+    )
     return parser
 
 
@@ -130,6 +186,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             location = f"{exc.filename}: " if exc.filename else ""
             print(
                 f"ops-workbench diff-audits: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "decide":
+        try:
+            return run_decide(
+                args.db, args.batch, args.identity, args.action, args.reason
+            )
+        except DecisionConflictError as exc:
+            print(f"ops-workbench decide: error: {exc}", file=sys.stderr)
+            return 3
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench decide: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "review-decisions":
+        try:
+            return run_review(args.db, args.old, args.new, args.output)
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench review-decisions: error: {location}{exc.message}",
                 file=sys.stderr,
             )
             return 2
