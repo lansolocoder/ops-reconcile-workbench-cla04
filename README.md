@@ -78,4 +78,36 @@ python3 -m ops_workbench review-decisions --db batches.db OLD NEW [--output O]
 - 结果按身份逐项升序；同一身份的 `invalid` 先于 `pending`。末行为 `["summary",kept数,invalid数,pending数,OLD哈希,NEW哈希]`。
 - 成功退出 0；数据库或批次不存在退出 2（原因写入 stderr，不产生部分结果）。默认写 stdout；指定 `--output O` 时沿用原子替换保护，失败保留旧文件。
 
+## propose-fix
+
+对一条已登记 `fix` 决定的发现提交可追溯的单元格修正提案：
+
+```bash
+python3 -m ops_workbench propose-fix --db batches.db BATCH ID PATCH
+```
+
+- `ID` 沿用 `diff-audits` 的发现身份 JSON，且必须命中 `BATCH` 的某条发现。
+- `BATCH` 必须已有该身份的 `fix` 决定，且决定中保存的完整发现与批次当前保存的完整发现一致。
+- `PATCH` 为非空 JSON 数组，每项是 `[记录号,字段,新值]`；字段只能是五个审计逻辑字段（`order_id`、`sku`、`qty`、`status`、`updated_at`，不是表头列名），记录号为正整数，新值为 JSON 字符串；同一 `[记录号,字段]` 目标不得重复。
+- `invalid` 发现只能改其身份指定的那一个单元格；`duplicate`/`conflict` 发现只能改发现记录号列表中的记录（五个字段均可）。每个新值都必须通过对应字段校验（`order_id`/`sku` 按修剪后非空，其余按原文字面规则）。
+- 校验通过后，原完整发现与 PATCH 一并以规范 JSON 存入独立的 `fix_proposals` 表（`batch_id` + 身份 JSON 为主键）。
+- 同 ID 同内容重复提交幂等返回 0；同 ID 不同 PATCH 退出 3 且不改记录；PATCH 非法、ID 未命中、没有对应 `fix` 决定或决定发现失配、批次/数据库缺失等其他错误退出 2，且不写库（失败前不会建表）。
+
+## apply-fixes
+
+回放某来源批次的全部修正提案，生成修正后的 CSV 并作为派生批次追溯：
+
+```bash
+python3 -m ops_workbench apply-fixes --db batches.db SOURCE DERIVED INPUT \
+  --output fixed.csv [--report fixed.jsonl]
+```
+
+- INPUT 的原始字节 SHA-256 必须等于 SOURCE 批次保存的输入哈希；`--output` 不得与 INPUT 为同一文件，INPUT 全程不改。
+- SOURCE 的每条 `fix` 决定都必须有提案；每条提案保存的完整发现仍须匹配 SOURCE 的发现集，且对应决定仍是 `fix`，否则退出 2。
+- 所有提案按发现身份、记录号、逻辑字段升序展开为单元格编辑并应用；再用 SOURCE 保存的 schema 对修正结果重新审计。
+- 输出 CSV 保持原表头、列序、额外列及所有未改单元格的值；以 UTF-8 无 BOM、`\n` 行结束写出（输入中的 BOM 与 CRLF 按此规范规范化）。重新审计的 JSONL 默认写 stdout，指定 `--report R` 时写入 R。
+- DERIVED 在独立的 `derived_batches` 表中保存：修正后输入的新哈希、schema、重新审计的发现集、SOURCE 批次 ID 与 SOURCE 输入哈希，以及应用时刻 SOURCE 的决定/提案快照。
+- 同一 DERIVED ID 且全部存储内容相同为幂等（退出 0，输出按相同内容重写）；同 ID 内容不同退出 3。
+- 失效决定/提案、非法修正、INPUT 读写错误、数据库错误或重新审计错误均退出 2：数据库、DERIVED 记录与旧输出（CSV、R）全部保持不变，临时文件清理。两个输出文件都先完整写入同目录临时文件，再在数据库事务提交前依次原子替换。
+
 仅使用 Python 标准库，不会创建业务数据文件。
