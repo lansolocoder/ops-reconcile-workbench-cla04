@@ -29,4 +29,26 @@ python3 -m ops_workbench audit-orders \
 - 无发现退出 0，有发现退出 1；schema、编码、CSV 或表头错误退出 2（原因写入 stderr，不生成报告）。
 - 默认写 stdout；指定 `--output O` 时报告完整生成后原子替换 `O`，失败时保留旧文件并清理临时文件。
 
+### 批次追溯：`--db DB --batch ID`
+
+`--db` 与 `--batch` 必须成对出现。完整扫描结束后（退出码仍为 0 或 1），在 SQLite 数据库 `DB` 中以单事务保存：批次 ID、输入原始字节 SHA-256、解析后的 schema、除 summary 外的发现集。
+
+- 同一 ID 再次运行时，若哈希、schema、发现集三者均相同，则幂等返回报告（不写库）。
+- 任一不同则退出 3，stderr 说明冲突的字段及两侧取值；数据库与既有输出文件均不改变。
+- 输入、数据库或写出错误退出 2，不改写任何批次。
+
+## diff-audits
+
+解释两个已保存批次的差异：
+
+```bash
+python3 -m ops_workbench diff-audits --db batches.db OLD NEW [--output diff.jsonl]
+```
+
+发现身份：`invalid` 取 `["invalid",记录号,字段]`；`duplicate`/`conflict` 取 `[类型,order_id,sku]`。
+
+- 仅 NEW 有的输出 `["added",身份,NEW发现]`；仅 OLD 有的输出 `["resolved",身份,OLD发现]`；同身份但完整发现不同输出 `["changed",身份,OLD发现,NEW发现]`；完全相同则省略。
+- 结果按身份逐项升序，末行为 `["summary",added数,resolved数,changed数,OLD哈希,NEW哈希]`。
+- 任一批次不存在退出 2 且无部分结果；默认写 stdout，指定 `--output O` 时沿用原子替换保护。
+
 仅使用 Python 标准库，不会创建业务数据文件。

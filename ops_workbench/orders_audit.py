@@ -171,6 +171,22 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
     including the trailing ``summary`` item.  Raises :class:`AuditError` for
     fatal schema, encoding, CSV or header errors.
     """
+    findings, row_count, _schema, _digest = _audit_scan(
+        data, schema_text, input_name
+    )
+    return findings, row_count
+
+
+def _audit_scan(
+    data: bytes, schema_text: str, input_name: str
+) -> tuple[list[list], int, dict[str, list[str]], str]:
+    """Run the audit and return ``(findings, data_row_count, schema, hash)``.
+
+    ``findings`` includes the trailing ``summary`` item; ``schema`` is the
+    parsed mapping and ``hash`` is the SHA-256 hex digest of the raw input
+    bytes.  Raises :class:`AuditError` for fatal schema, encoding, CSV or
+    header errors.
+    """
     schema = parse_schema(schema_text)
 
     # A leading BOM is allowed on INPUT and stripped; the original bytes
@@ -289,7 +305,7 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
 
     digest = hashlib.sha256(data).hexdigest()
     findings.append(["summary", data_row_count, len(findings), digest])
-    return findings, data_row_count
+    return findings, data_row_count, schema, digest
 
 
 def serialize(findings: list[list]) -> bytes:
@@ -304,11 +320,21 @@ def run_audit(
     input_path: str,
     output_path: str | None = None,
     stdout: BinaryIO | TextIO | None = None,
+    db_path: str | None = None,
+    batch_id: str | None = None,
 ) -> int:
     """File-level wrapper: read INPUT, produce the report, return exit code.
 
     Fatal problems raise :class:`AuditError`; the caller renders stderr.
     The report is only emitted after the whole scan succeeds.
+
+    When both ``db_path`` and ``batch_id`` are given, the scan is persisted
+    as a batch after the full scan completes.  An existing batch with the
+    same id must match the input hash, schema and finding set exactly; the
+    report is then returned idempotently.  A mismatch raises
+    :class:`~ops_workbench.batches.BatchConflict` (exit status 3) and the
+    report is not emitted, leaving the database and the previous output
+    file untouched.
     """
     try:
         with open(input_path, "rb") as fh:
@@ -316,10 +342,45 @@ def run_audit(
     except OSError as exc:
         raise AuditError(f"cannot read input file: {exc}", filename=input_path)
 
-    findings, _ = audit(data, schema_text, input_path)
+    findings, _, schema, digest = _audit_scan(data, schema_text, input_path)
+    issue_findings = findings[:-1]
     payload = serialize(findings)
-    issue_count = len(findings) - 1  # the last item is the summary
+    issue_count = len(issue_findings)
 
+    if db_path is not None and batch_id is not None:
+        # Imported lazily to keep the batch/SQLite dependency out of the
+        # plain audit path.
+        from .batches import BatchStore
+
+        # Single-transaction insert/verify: on conflict or database error
+        # nothing is written and no report is emitted.
+        with BatchStore(db_path) as store:
+            inserted = store.save_or_verify(
+                batch_id, digest, schema, issue_findings
+            )
+            try:
+                _emit_report(payload, output_path, stdout)
+            except Exception:
+                # A write-out error (exit 2) must not leave the batch
+                # modified: undo the insert we just committed.  The
+                # original write error takes precedence if the undo fails.
+                if inserted:
+                    try:
+                        store.delete(batch_id)
+                    except Exception:
+                        pass
+                raise
+    else:
+        _emit_report(payload, output_path, stdout)
+
+    return 1 if issue_count else 0
+
+
+def _emit_report(
+    payload: bytes,
+    output_path: str | None,
+    stdout: BinaryIO | TextIO | None,
+) -> None:
     if output_path is None:
         if stdout is None:  # pragma: no cover - always injected by main
             import sys
@@ -336,8 +397,6 @@ def run_audit(
             raise AuditError(f"cannot write report: {exc}", filename="<stdout>")
     else:
         _atomic_write(output_path, payload)
-
-    return 1 if issue_count else 0
 
 
 def _atomic_write(path: str, payload: bytes) -> None:
