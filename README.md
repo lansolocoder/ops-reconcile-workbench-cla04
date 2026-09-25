@@ -107,4 +107,21 @@ python3 -m ops_workbench apply-fixes --db batches.db SOURCE DERIVED INPUT \
 - 单事务在 `derived_batches` 表以 `DERIVED` 保存新哈希、schema、发现集、`SOURCE` 批次 ID 以及按身份升序的决定/提案快照：逐项保存决定的 `action`、修剪后的 `reason`、决定绑定的完整原发现，以及提案绑定的完整原发现与 PATCH（均取自存储内容，不从当前发现反推）。同一 `DERIVED` 且内容完全相同幂等返回 0（仍重新生成输出）；内容不同退出 3 且不触碰旧输出。
 - 退出 0 表示应用与重审计成功（无论重审计是否还有发现，审计结果以 JSONL 的 summary 为准）。失效决定、非法修正以及读写、数据库、审计错误一律退出 2：替换前先保存 CSV 与报告各自的原有字节及“原先不存在”状态，任一暂存、替换或事务提交失败都会回滚 `DERIVED`，并把两个输出恢复到调用前的字节或不存在状态（已成功替换的也撤回），同时清理本次临时文件与恢复备份；若恢复本身也失败，stderr 会同时说明原失败与恢复失败，绝不宣称成功。
 
+## reconcile-fulfillments
+
+在同一 schema 下对订单 CSV 与履约 CSV 做数量对账：
+
+```bash
+python3 -m ops_workbench reconcile-fulfillments \
+  --schema '{"order_id":["oid"],"sku":["sku"],"qty":["qty"],"status":["status"],"updated_at":["updated_at"]}' \
+  orders.csv fulfillments.csv [--output report.jsonl]
+```
+
+- schema、BOM、表头、列映射、行宽与五字段校验沿用 `audit-orders`（`order_id`、`sku` 修剪）；`ORDERS.status` 限 `open|cancelled`，`FULFILLMENTS.status` 限 `shipped|cancelled`。
+- schema、编码、CSV、表头、行宽或字段值错误一律退出 2（原因写入 stderr，不生成报告，也不产生 `invalid` 记录）。
+- 按 `(order_id, sku)` 取并集：`O` 为 ORDERS `open` 行 qty 之和，`F` 为 FULFILLMENTS `shipped` 行 qty 之和，`cancelled` 行不计入。按键升序输出 `["reconcile",order_id,sku,O,F,outcome]`。
+- `outcome` 唯一：`0/0` 为 `cancelled-only`，`0/F>0` 为 `orphan-fulfillment`，`O>0/0` 为 `no-fulfillment`；均正时 `F=O` 为 `balanced`、`F<O` 为 `under`、`F>O` 为 `over`。
+- 末行 `["summary",g,c,H1,H2]`：`g` 为组数，`c` 以六种 outcome 为键、值为对应组数，`H1`/`H2` 为两输入原始字节的 SHA-256（64 字符小写十六进制）。空结果只输出 summary 行。
+- 成功退出 0；默认写 stdout，指定 `--output O` 时报告完整生成后原子替换，失败保留旧文件并清理临时文件。
+
 仅使用 Python 标准库。
