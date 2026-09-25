@@ -9,6 +9,7 @@ from .decisions import DecisionConflictError, run_decide, run_review
 from .diff_audits import run_diff
 from .fixes import FixConflictError, run_apply_fixes, run_propose_fix
 from .orders_audit import AuditError, BatchConflictError, run_audit
+from .reconcile_fulfillments import run_reconcile
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -62,6 +63,42 @@ def _build_parser() -> argparse.ArgumentParser:
             "store this run under batch ID in --db; an identical stored "
             "batch is returned idempotently, a conflicting one exits 3"
         ),
+    )
+
+    reconcile = subparsers.add_parser(
+        "reconcile-fulfillments",
+        help="reconcile open order quantities against shipped fulfillments",
+        description=(
+            "Reconcile an orders CSV against a fulfillments CSV by "
+            "(order_id, sku) and emit per-key quantities and outcomes as "
+            "JSON Lines."
+        ),
+    )
+    reconcile.add_argument(
+        "--schema",
+        required=True,
+        metavar="S",
+        help=(
+            "UTF-8 JSON object with exactly the keys order_id, sku, qty, "
+            "status, updated_at; each value is a non-empty array of candidate "
+            "header column names. Applied to both CSV files."
+        ),
+    )
+    reconcile.add_argument(
+        "orders",
+        metavar="ORDERS",
+        help="UTF-8 orders CSV (status open or cancelled)",
+    )
+    reconcile.add_argument(
+        "fulfillments",
+        metavar="FULFILLMENTS",
+        help="UTF-8 fulfillments CSV (status shipped or cancelled)",
+    )
+    reconcile.add_argument(
+        "--output",
+        metavar="O",
+        default=None,
+        help="write the report here (atomically replaced); defaults to stdout",
     )
 
     diff = subparsers.add_parser(
@@ -245,6 +282,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             location = f"{exc.filename}: " if exc.filename else ""
             print(
                 f"ops-workbench audit-orders: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "reconcile-fulfillments":
+        try:
+            return run_reconcile(
+                args.schema, args.orders, args.fulfillments, args.output
+            )
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench reconcile-fulfillments: error: "
+                f"{location}{exc.message}",
                 file=sys.stderr,
             )
             return 2

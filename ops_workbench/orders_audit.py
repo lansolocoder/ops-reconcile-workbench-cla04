@@ -164,11 +164,16 @@ def _valid_iso8601_seconds(text: str) -> bool:
     return True
 
 
-def _field_valid(field: str, raw_value: str) -> tuple[bool, str]:
+def _field_valid(
+    field: str,
+    raw_value: str,
+    statuses: tuple[str, ...] = ("open", "cancelled"),
+) -> tuple[bool, str]:
     """Return ``(valid, comparison_value)`` for a raw cell.
 
     Only ``order_id`` and ``sku`` are trimmed before checking; the other
-    fields must match their rule verbatim.
+    fields must match their rule verbatim.  ``status`` is checked against
+    ``statuses``, which defaults to the orders vocabulary.
     """
     if field in ("order_id", "sku"):
         value = raw_value.strip()
@@ -176,18 +181,23 @@ def _field_valid(field: str, raw_value: str) -> tuple[bool, str]:
     if field == "qty":
         return _QTY_RE.match(raw_value) is not None, raw_value
     if field == "status":
-        return raw_value in ("open", "cancelled"), raw_value
+        return raw_value in statuses, raw_value
     if field == "updated_at":
         return _valid_iso8601_seconds(raw_value), raw_value
     return False, raw_value  # pragma: no cover - defensive, FIELDS is fixed
 
 
-def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], int]:
-    """Run the audit; return ``(findings, data_row_count)``.
+def _open_csv(
+    data: bytes, schema_text: str, input_name: str
+) -> tuple[dict[str, int], Iterator[tuple[int, list[str]]]]:
+    """Validate schema/encoding/CSV/header; return ``(columns, data rows)``.
 
-    Findings are plain JSON-compatible lists in their final output order,
-    including the trailing ``summary`` item.  Raises :class:`AuditError` for
-    fatal schema, encoding, CSV or header errors.
+    The row iterator yields ``(record_no, raw_cells)`` for every non-blank
+    data record and enforces the row width.  Record numbers are logical
+    record numbers as delivered by the CSV parser: the header is record 1
+    and every subsequent logical record increments the counter, including
+    skipped blank records.  A quoted newline inside a field does NOT start
+    a new record.
     """
     schema = parse_schema(schema_text)
 
@@ -224,41 +234,53 @@ def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], i
 
     columns = resolve_columns(schema, header)
 
+    def rows() -> Iterator[tuple[int, list[str]]]:
+        record_no = 1
+        while True:
+            # Physical line the next record starts on (blank inter-record
+            # lines advance line_num too); used only for malformed-CSV
+            # diagnostics.
+            start_line = reader.line_num + 1
+            try:
+                raw = next(reader)
+            except StopIteration:
+                return
+            except csv.Error as exc:
+                raise AuditError(f"malformed CSV near line {start_line}: {exc}",
+                                 filename=input_name)
+            record_no += 1
+
+            # A blank physical line parses to []; a line containing only
+            # whitespace yields a single whitespace cell. Neither is a
+            # data row.
+            if not raw or (len(raw) == 1 and raw[0].strip() == ""):
+                continue
+            if len(raw) != len(header):
+                raise AuditError(
+                    f"record {record_no} has {len(raw)} fields but the header "
+                    f"has {len(header)}",
+                    filename=input_name,
+                )
+            yield record_no, raw
+
+    return columns, rows()
+
+
+def audit(data: bytes, schema_text: str, input_name: str) -> tuple[list[list], int]:
+    """Run the audit; return ``(findings, data_row_count)``.
+
+    Findings are plain JSON-compatible lists in their final output order,
+    including the trailing ``summary`` item.  Raises :class:`AuditError` for
+    fatal schema, encoding, CSV or header errors.
+    """
+    columns, data_rows = _open_csv(data, schema_text, input_name)
+
     findings: list[list] = []
     groups: dict[tuple[str, str], list[tuple[int, int, str, str]]] = defaultdict(list)
     data_row_count = 0
 
-    # Logical record numbers as delivered by the CSV parser: the header is
-    # record 1 and every subsequent logical record increments the counter,
-    # including skipped blank records.  A quoted newline inside a field does
-    # NOT start a new record.
-    record_no = 1
-
-    while True:
-        # Physical line the next record starts on (blank inter-record lines
-        # advance line_num too); used only for malformed-CSV diagnostics.
-        start_line = reader.line_num + 1
-        try:
-            raw = next(reader)
-        except StopIteration:
-            break
-        except csv.Error as exc:
-            raise AuditError(f"malformed CSV near line {start_line}: {exc}",
-                             filename=input_name)
-        record_no += 1
-
-        # A blank physical line parses to []; a line containing only
-        # whitespace yields a single whitespace cell. Neither is a data row.
-        if not raw or (len(raw) == 1 and raw[0].strip() == ""):
-            continue
+    for record_no, raw in data_rows:
         data_row_count += 1
-
-        if len(raw) != len(header):
-            raise AuditError(
-                f"record {record_no} has {len(raw)} fields but the header has "
-                f"{len(header)}",
-                filename=input_name,
-            )
 
         values: dict[str, str] = {}
         row_invalid = False

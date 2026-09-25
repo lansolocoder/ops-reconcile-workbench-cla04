@@ -35,6 +35,23 @@ python3 -m ops_workbench audit-orders \
 
 同一 ID 再次运行时，仅当哈希、schema、发现集三者均相同才幂等返回报告（数据库不变）；否则退出 3，stderr 说明冲突的方面，数据库与旧输出均不变。输入、数据库或写出错误退出 2，不会改写批次。
 
+## reconcile-fulfillments
+
+按 `(order_id, sku)` 键对账订单与履约数量并输出 JSON Lines：
+
+```bash
+python3 -m ops_workbench reconcile-fulfillments \
+  --schema '{"order_id":["oid"],"sku":["sku"],"qty":["qty"],"status":["status"],"updated_at":["updated_at"]}' \
+  orders.csv fulfillments.csv [--output report.jsonl]
+```
+
+- schema、BOM、表头、列映射、行宽与五字段校验均沿用 audit-orders（同一 schema 同时作用于两个文件）；`order_id`、`sku` 修剪后非空。ORDERS 的 `status` 限 `open|cancelled`，FULFILLMENTS 的 `status` 限 `shipped|cancelled`。
+- schema、编码、CSV、表头、行宽或字段值错误一律退出 2（原因写入 stderr，不生成报告，也不产生 `invalid` 发现）。
+- 按 `(order_id, sku)` 取两文件键的并集：`O` 为 ORDERS 中 `open` 行的 qty 之和，`F` 为 FULFILLMENTS 中 `shipped` 行的 qty 之和，`cancelled` 行不计入数量但仍贡献键。按键升序输出 `["reconcile",order_id,sku,O,F,outcome]`。
+- `outcome` 唯一确定：`O=0,F=0` 为 `cancelled-only`；`O=0,F>0` 为 `orphan-fulfillment`；`O>0,F=0` 为 `no-fulfillment`；均正时 `F=O` 为 `balanced`、`F<O` 为 `under`、`F>O` 为 `over`。
+- 末行 `["summary",g,c,H1,H2]`：`g` 为组数，`c` 以六种 outcome 为键、对应组数为值，`H1`、`H2` 分别为 ORDERS 与 FULFILLMENTS 原始字节的 SHA-256（64 位小写十六进制）。两文件都无数据行时仅输出 summary 行。
+- 成功退出 0；默认写 stdout，指定 `--output O` 时报告完整生成后原子替换，失败保留旧文件并清理临时文件。
+
 ## diff-audits
 
 比较两个已存批次的发现集并输出差异解释：
