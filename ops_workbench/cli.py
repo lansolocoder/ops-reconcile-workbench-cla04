@@ -5,6 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
+from .batch_order import run_batch_order
 from .decisions import DecisionConflictError, run_decide, run_review
 from .diff_audits import run_diff
 from .fixes import FixConflictError, run_apply_fixes, run_propose_fix
@@ -213,6 +214,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write the re-audit JSONL here (atomically replaced); defaults to stdout",
     )
 
+    order = subparsers.add_parser(
+        "batch-order",
+        help="explain where batches come from and which share a source",
+        description=(
+            "Explain the provenance of at least two batches stored in the "
+            "--db SQLite database (source batches from audit-orders and "
+            "derived batches from apply-fixes) as JSON Lines."
+        ),
+    )
+    order.add_argument(
+        "--db",
+        required=True,
+        metavar="DB",
+        help="SQLite database written by audit-orders and apply-fixes",
+    )
+    order.add_argument(
+        "batches",
+        metavar="BATCH",
+        nargs="+",
+        help="at least two batch ids to explain, in the desired output order",
+    )
+    order.add_argument(
+        "--output",
+        metavar="O",
+        default=None,
+        help="write the explanation here (atomically replaced); defaults to stdout",
+    )
+
     reconcile = subparsers.add_parser(
         "reconcile-fulfillments",
         help="reconcile an orders CSV against a fulfillments CSV",
@@ -358,6 +387,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             location = f"{exc.filename}: " if exc.filename else ""
             print(
                 f"ops-workbench apply-fixes: error: {location}{exc.message}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.command == "batch-order":
+        if len(args.batches) < 2:
+            print(
+                "ops-workbench batch-order: error: at least two BATCH ids "
+                "are required",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            return run_batch_order(args.db, args.batches, args.output)
+        except AuditError as exc:
+            location = f"{exc.filename}: " if exc.filename else ""
+            print(
+                f"ops-workbench batch-order: error: {location}{exc.message}",
                 file=sys.stderr,
             )
             return 2
