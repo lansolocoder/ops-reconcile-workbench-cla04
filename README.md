@@ -107,6 +107,19 @@ python3 -m ops_workbench apply-fixes --db batches.db SOURCE DERIVED INPUT \
 - 单事务在 `derived_batches` 表以 `DERIVED` 保存新哈希、schema、发现集、`SOURCE` 批次 ID 以及按身份升序的决定/提案快照：逐项保存决定的 `action`、修剪后的 `reason`、决定绑定的完整原发现，以及提案绑定的完整原发现与 PATCH（均取自存储内容，不从当前发现反推）。同一 `DERIVED` 且内容完全相同幂等返回 0（仍重新生成输出）；内容不同退出 3 且不触碰旧输出。
 - 退出 0 表示应用与重审计成功（无论重审计是否还有发现，审计结果以 JSONL 的 summary 为准）。失效决定、非法修正以及读写、数据库、审计错误一律退出 2：替换前先保存 CSV 与报告各自的原有字节及“原先不存在”状态，任一暂存、替换或事务提交失败都会回滚 `DERIVED`，并把两个输出恢复到调用前的字节或不存在状态（已成功替换的也撤回），同时清理本次临时文件与恢复备份；若恢复本身也失败，stderr 会同时说明原失败与恢复失败，绝不宣称成功。
 
+## batch-order
+
+按业务顺序解释每个已存批次的溯源关系：
+
+```bash
+python3 -m ops_workbench batch-order --db batches.db BATCH... [--output O]
+```
+
+- 至少给出两个批次 ID，按给定顺序每个批次输出一行 `[批次ID,种类,来源批次ID,派生自批次ID,input_sha256]`。`audit-orders --batch` 存的是来源批次（`source`），`apply-fixes` 在 `derived_batches` 存的是派生批次（`derived`）。
+- 派生批次的派生自批次 ID 恒为其直接 `SOURCE` 批次 ID（原样给出，即便该批次已不存在）；来源批次 ID 沿 `source_batch_id` 链逐级上溯，遇到非派生批次即取其 ID，链条断裂（指向的派生行丢失或批次完全不存在）时为 `null`。来源批次的来源 ID 是其自身，派生自 ID 为 `null`。
+- 末行为 `["summary",批次数,来源批次数,派生批次数,[去重升序的input_sha256列表]]`，计数按每行标注的种类统计，不受来源 ID 是否为 `null` 影响。
+- 成功退出 0；任一批次 ID 在 `batches` 与 `derived_batches` 中都查不到、数据库不存在或参数非法均退出 2（原因写入 stderr，不产生部分输出，不改写数据库）。默认写 stdout；指定 `--output O` 时报告完整生成后原子替换，失败保留旧文件并清理临时文件。
+
 ## reconcile-fulfillments
 
 在同一 schema 下对订单 CSV 与履约 CSV 做数量对账：
