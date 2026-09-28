@@ -119,8 +119,10 @@ python3 -m ops_workbench batch-order --db batches.db BATCH... [--output O]
 - 每个批次一行：`[批次ID,种类,来源批次ID,派生批次ID,input_sha256]`。种类为 `"source"`（`audit-orders --batch` 扫描原始输入产生的 `batches` 行）或 `"derived"`（`apply-fixes` 保存在 `derived_batches` 的行，哈希即修正后 CSV 的 SHA-256，64 位小写十六进制）。
 - 派生批次的派生批次 ID 恒为其直接 `SOURCE` 批次 ID，原样给出（即便该批次已不存在）；来源批次 ID 沿 `source_batch_id` 链逐级上溯，遇到不在 `derived_batches` 中的批次即取其 ID。链条指向的派生批次行已丢失，或指向的批次在两张表中都不存在时，该行来源批次 ID 为 `null`，其余字段照常。
 - 非派生批次的来源批次 ID 是其自身，派生批次 ID 为 `null`。
-- 末行 `["summary",批次数,来源批次数,派生批次数,哈希列表]`：种类计数按每行标注统计（不受来源 ID 是否为 `null` 影响）；哈希列表为全体行 `input_sha256` 去重后升序。
-- 任一批次 ID 在 `batches` 与 `derived_batches` 中都查不到、数据库不存在或参数非法时退出 2（原因写入 stderr，不产生任何部分输出，也不改写数据库）。默认写 stdout；指定 `--output O` 时报告完整生成后原子替换 `O`，失败时保留旧文件并清理临时文件。
+- 每个派生批次的溯源行之后，额外逐行解释该批次保存的决定/修正快照的修正影响；ID 指向 `batches` 的来源批次不输出任何修正影响行。修正影响行紧跟其溯源行、在下一个批次的溯源行之前，批次内按快照条目身份升序，格式为 `["fix",派生批次ID,身份,[ACTION,REASON],新值列表]`：身份沿用 `diff-audits` 的发现身份文本；`[ACTION,REASON]` 取该条目决定的 action 与修剪后的 reason；新值列表为该条目提案 PATCH 的全部 `[记录号,字段,新值]` 三元组按记录号、字段名升序合并后的扁平 `[记录号,字段,新值]…` 序列（同一发现的每个目标单元格逐项列出）。快照为空数组时该批次只输出溯源行。
+- 快照不是合法 JSON，或任一条目缺少身份、决定（action/reason）或提案（PATCH）字段时，整次运行退出 2，原因写入 stderr，不产生任何部分输出，也不改写数据库或既有输出文件。
+- 末行 `["summary",批次数,来源批次数,派生批次数,哈希列表]`：种类计数按每行标注统计（不受来源 ID 是否为 `null` 影响）；哈希列表为全体溯源行 `input_sha256` 去重后升序。修正影响行不计入任何 summary 计数。
+- 任一批次 ID 在 `batches` 与 `derived_batches` 中都查不到、数据库不存在或参数非法时退出 2（原因写入 stderr，不产生任何部分输出，也不改写数据库）。默认写 stdout；指定 `--output O` 时全部行（含修正影响行）完整生成后原子替换 `O`，失败时保留旧文件并清理临时文件。
 
 ## reconcile-fulfillments
 

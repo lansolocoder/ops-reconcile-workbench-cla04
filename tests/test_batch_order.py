@@ -10,7 +10,13 @@ import sys
 import tempfile
 import unittest
 
-from ops_workbench.batch_order import build_batch_order, run_batch_order
+from ops_workbench.batch_order import (
+    build_batch_order,
+    build_order_with_fixes,
+    run_batch_order,
+)
+from ops_workbench.decisions import run_decide
+from ops_workbench.fixes import run_apply_fixes, run_propose_fix
 from ops_workbench.orders_audit import AuditError, run_audit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +31,7 @@ SCHEMA = json.dumps(
     }
 )
 HEADER = "oid,sku,qty,status,updated_at\n"
+TS = "2024-01-02T03:04:05Z"
 CLEAN_ROW = "A1,S1,3,open,2024-01-02T03:04:05Z\n"
 
 
@@ -68,7 +75,13 @@ class BatchOrderDatabase(unittest.TestCase):
         self.assertIn(code, (0, 1))
         return hashlib.sha256(csv_text.encode()).hexdigest()
 
-    def store_derived(self, derived_id: str, source_id: str, digest: str) -> None:
+    def store_derived(
+        self,
+        derived_id: str,
+        source_id: str,
+        digest: str,
+        snapshot: str = "[]",
+    ) -> None:
         """Insert a derived_batches row with the minimum trace columns."""
         conn = self.connect()
         try:
@@ -81,8 +94,8 @@ class BatchOrderDatabase(unittest.TestCase):
             conn.execute(
                 "INSERT INTO derived_batches (derived_id, input_sha256, "
                 "schema_json, findings_json, source_batch_id, snapshot_json) "
-                "VALUES (?, ?, '{}', '[]', ?, '[]')",
-                (derived_id, digest, source_id),
+                "VALUES (?, ?, '{}', '[]', ?, ?)",
+                (derived_id, digest, source_id, snapshot),
             )
             conn.commit()
         finally:
@@ -93,6 +106,73 @@ class BatchOrderDatabase(unittest.TestCase):
         try:
             conn.execute(
                 "DELETE FROM derived_batches WHERE derived_id = ?", (derived_id,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def store_applied_derived(self, derived_id: str = "der") -> str:
+        """Run a full decide/propose/apply-fixes flow; return the new hash.
+
+        The source batch has one invalid-qty finding and one duplicate
+        group, each with a fix decision and a proposal, so the derived
+        snapshot carries two fix entries.
+        """
+        csv_text = (
+            HEADER
+            + f"A0,S0,0,open,{TS}\n"
+            + f"A1,S1,2,open,{TS}\n"
+            + f"A1,S1,2,open,{TS}\n"
+        )
+        self.input.write_bytes(csv_text.encode())
+        code = run_audit(
+            SCHEMA,
+            str(self.input),
+            stdout=io.BytesIO(),
+            db_path=str(self.db_path),
+            batch_id="src",
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            run_decide(
+                str(self.db_path), "src", '["invalid",2,"qty"]', "fix", "  r1  "
+            ),
+            0,
+        )
+        self.assertEqual(
+            run_decide(
+                str(self.db_path), "src", '["duplicate","A1","S1"]',
+                "fix", "r2",
+            ),
+            0,
+        )
+        self.assertEqual(
+            run_propose_fix(
+                str(self.db_path), "src", '["invalid",2,"qty"]', '[[2,"qty","5"]]'
+            ),
+            0,
+        )
+        self.assertEqual(
+            run_propose_fix(
+                str(self.db_path), "src", '["duplicate","A1","S1"]',
+                '[[3,"sku","S7"]]',
+            ),
+            0,
+        )
+        corrected = self.db_path.parent / "corrected.csv"
+        code = run_apply_fixes(
+            str(self.db_path), "src", derived_id, str(self.input),
+            str(corrected), stdout=io.BytesIO(),
+        )
+        self.assertEqual(code, 0)
+        return hashlib.sha256(corrected.read_bytes()).hexdigest()
+
+    def overwrite_snapshot(self, derived_id: str, snapshot: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE derived_batches SET snapshot_json = ? WHERE derived_id = ?",
+                (snapshot, derived_id),
             )
             conn.commit()
         finally:
@@ -144,6 +224,133 @@ class BuildBatchOrderTests(unittest.TestCase):
         rows = build_batch_order(batches, {}, ["c", "a", "b", "a"])
         self.assertEqual([r[0] for r in rows[:-1]], ["c", "a", "b", "a"])
         self.assertEqual(rows[-1], ["summary", 4, 4, 0, ["h1", "h2"]])
+
+
+def _entry(identity: list, action: str, reason: str, patch: list) -> dict:
+    """A decision/proposal snapshot entry shaped like apply-fixes stores it."""
+    return {
+        "identity": identity,
+        "action": action,
+        "reason": reason,
+        "finding": list(identity),
+        "proposal": {"finding": list(identity), "patch": patch},
+    }
+
+
+class BuildFixImpactTests(unittest.TestCase):
+    def _derived(self, snapshot_text: str) -> dict:
+        return {"d": ("hd", "s", snapshot_text)}
+
+    def test_source_batch_emits_no_fix_rows(self) -> None:
+        rows = build_order_with_fixes({"s": "h0"}, {}, ["s"])
+        self.assertEqual(
+            rows,
+            [
+                ["s", "source", "s", None, "h0"],
+                ["summary", 1, 1, 0, ["h0"]],
+            ],
+        )
+
+    def test_empty_snapshot_emits_only_the_provenance_row(self) -> None:
+        rows = build_order_with_fixes({"s": "h0"}, self._derived("[]"), ["d"])
+        self.assertEqual(
+            rows,
+            [
+                ["d", "derived", "s", "s", "hd"],
+                ["summary", 1, 0, 1, ["hd"]],
+            ],
+        )
+
+    def test_fix_rows_follow_the_provenance_row_sorted_by_identity(self) -> None:
+        snapshot = [
+            _entry(["invalid", 5, "sku"], "fix", "  s  ", [[5, "sku", "S9"]]),
+            _entry(["duplicate", "A1", "S1"], "fix", "d",
+                   [[4, "sku", "S7"], [3, "qty", "8"]]),
+        ]
+        rows = build_order_with_fixes(
+            {"s": "h0"}, self._derived(json.dumps(snapshot)), ["d"]
+        )
+        self.assertEqual(
+            rows,
+            [
+                ["d", "derived", "s", "s", "hd"],
+                ["fix", "d", ["duplicate", "A1", "S1"], ["fix", "d"],
+                 [3, "qty", "8", 4, "sku", "S7"]],
+                ["fix", "d", ["invalid", 5, "sku"], ["fix", "s"],
+                 [5, "sku", "S9"]],
+                ["summary", 1, 0, 1, ["hd"]],
+            ],
+        )
+
+    def test_snapshot_need_not_be_presorted(self) -> None:
+        snapshot = [
+            _entry(["invalid", 9, "qty"], "fix", "b", [[9, "qty", "1"]]),
+            _entry(["invalid", 2, "qty"], "fix", "a", [[2, "qty", "5"]]),
+            _entry(["conflict", "A1", "S1"], "fix", "c", [[3, "sku", "Z"]]),
+        ]
+        rows = build_order_with_fixes(
+            {"s": "h0"}, self._derived(json.dumps(snapshot)), ["d"]
+        )
+        fix_identities = [row[2] for row in rows if row[0] == "fix"]
+        self.assertEqual(
+            fix_identities,
+            [["conflict", "A1", "S1"], ["invalid", 2, "qty"],
+             ["invalid", 9, "qty"]],
+        )
+
+    def test_patch_triples_merge_sorted_by_record_then_field(self) -> None:
+        snapshot = [
+            _entry(["duplicate", "A1", "S1"], "fix", "d",
+                   [[4, "sku", "S7"], [3, "status", "open"], [4, "qty", "8"]]),
+        ]
+        rows = build_order_with_fixes(
+            {"s": "h0"}, self._derived(json.dumps(snapshot)), ["d"]
+        )
+        self.assertEqual(
+            rows[1][4],
+            [3, "status", "open", 4, "qty", "8", 4, "sku", "S7"],
+        )
+
+    def test_multiple_derived_batches_keep_input_order(self) -> None:
+        snapshot = [_entry(["invalid", 2, "qty"], "fix", "r", [[2, "qty", "5"]])]
+        derived = {
+            "d1": ("h1", "s", json.dumps(snapshot)),
+            "d2": ("h2", "d1", "[]"),
+        }
+        rows = build_order_with_fixes({"s": "h0"}, derived, ["d2", "d1", "s"])
+        self.assertEqual(rows[0][0], "d2")
+        self.assertEqual(rows[1][0], "d1")
+        self.assertEqual(rows[2], ["fix", "d1", ["invalid", 2, "qty"],
+                                   ["fix", "r"], [2, "qty", "5"]])
+        self.assertEqual(rows[3][:2], ["s", "source"])
+        self.assertEqual(rows[-1], ["summary", 3, 1, 2,
+                                    sorted({"h0", "h1", "h2"})])
+
+    def test_corrupt_snapshot_is_fatal(self) -> None:
+        with self.assertRaises(AuditError):
+            build_order_with_fixes({"s": "h0"}, self._derived("{nope"), ["d"])
+
+    def test_incomplete_entries_are_fatal(self) -> None:
+        good = _entry(["invalid", 2, "qty"], "fix", "r", [[2, "qty", "5"]])
+        cases = []
+        broken = dict(good)
+        del broken["identity"]
+        cases.append(broken)
+        broken = dict(good)
+        del broken["action"]
+        cases.append(broken)
+        broken = dict(good)
+        del broken["proposal"]
+        cases.append(broken)
+        broken = dict(good)
+        broken["proposal"] = {"finding": []}  # missing patch
+        cases.append(broken)
+        for bad in cases:
+            with self.subTest(bad=bad):
+                with self.assertRaises(AuditError):
+                    build_order_with_fixes(
+                        {"s": "h0"}, self._derived(json.dumps([bad])), ["d"]
+                    )
 
 
 class RunBatchOrderTests(BatchOrderDatabase):
@@ -203,6 +410,70 @@ class RunBatchOrderTests(BatchOrderDatabase):
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
         self.assertEqual(lines[0], ["d", "derived", None, "ghost", "h1"])
+
+    def test_applied_derived_emits_its_fix_impact(self) -> None:
+        digest = self.store_applied_derived("der")
+        source_hash = hashlib.sha256(
+            (
+                HEADER
+                + f"A0,S0,0,open,{TS}\n"
+                + f"A1,S1,2,open,{TS}\n"
+                + f"A1,S1,2,open,{TS}\n"
+            ).encode()
+        ).hexdigest()
+        out = io.BytesIO()
+        code = run_batch_order(str(self.db_path), ["der", "src"], stdout=out)
+        self.assertEqual(code, 0)
+        lines = parse_lines(out.getvalue())
+        self.assertEqual(
+            lines,
+            [
+                ["der", "derived", "src", "src", digest],
+                ["fix", "der", ["duplicate", "A1", "S1"], ["fix", "r2"],
+                 [3, "sku", "S7"]],
+                ["fix", "der", ["invalid", 2, "qty"], ["fix", "r1"],
+                 [2, "qty", "5"]],
+                ["src", "source", "src", None, source_hash],
+                ["summary", 2, 1, 1, sorted({source_hash, digest})],
+            ],
+        )
+
+    def test_corrupt_snapshot_is_fatal_without_partial_output(self) -> None:
+        self.store_applied_derived("der")
+        self.overwrite_snapshot("der", "{not json")
+        out = io.BytesIO()
+        with self.assertRaises(AuditError) as ctx:
+            run_batch_order(str(self.db_path), ["der", "src"], stdout=out)
+        self.assertIn("not valid JSON", ctx.exception.message)
+        self.assertEqual(out.getvalue(), b"")
+
+    def test_incomplete_snapshot_entry_is_fatal_and_keeps_old_output(self) -> None:
+        self.store_applied_derived("der")
+        conn = self.connect()
+        try:
+            snapshot = json.loads(
+                conn.execute(
+                    "SELECT snapshot_json FROM derived_batches "
+                    "WHERE derived_id = 'der'"
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        del snapshot[0]["proposal"]
+        self.overwrite_snapshot("der", json.dumps(snapshot))
+
+        output = self.db_path.parent / "order.jsonl"
+        output.write_text("OLD CONTENT")
+        with self.assertRaises(AuditError) as ctx:
+            run_batch_order(str(self.db_path), ["der", "src"], str(output))
+        self.assertIn("no proposal", ctx.exception.message)
+        self.assertEqual(output.read_text(), "OLD CONTENT")
+        leftovers = [
+            p.name
+            for p in self.db_path.parent.iterdir()
+            if p.name.startswith(".order")
+        ]
+        self.assertEqual(leftovers, [])
 
     def test_unknown_batch_is_fatal_without_partial_output(self) -> None:
         self.store_source("b1")
@@ -265,6 +536,26 @@ class BatchOrderCliTests(BatchOrderDatabase):
         self.assertEqual(lines[0][:4], ["d", "derived", "b1", "b1"])
         self.assertEqual(lines[1][:4], ["b1", "source", "b1", None])
         self.assertEqual(lines[2][0], "summary")
+
+    def test_cli_emits_fix_impact_and_fails_on_corrupt_snapshot(self) -> None:
+        self.store_applied_derived("der")
+        result = run_cli(
+            "batch-order", "--db", str(self.db_path), "der", "src"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = parse_lines(result.stdout)
+        self.assertEqual(lines[0][0], "der")
+        self.assertEqual([line[0] for line in lines],
+                         ["der", "fix", "fix", "src", "summary"])
+        self.assertEqual(lines[-1][1:4], [2, 1, 1])
+
+        self.overwrite_snapshot("der", "{bad")
+        result = run_cli(
+            "batch-order", "--db", str(self.db_path), "der", "src"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("not valid JSON", result.stderr)
 
     def test_cli_requires_two_batch_ids(self) -> None:
         self.store_source("b1")
