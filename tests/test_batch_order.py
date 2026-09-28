@@ -12,6 +12,7 @@ import unittest
 
 from ops_workbench.batch_order import (
     build_batch_order,
+    build_correction_summary_rows,
     build_fix_impact_rows,
     run_batch_order,
 )
@@ -223,6 +224,110 @@ class BuildFixImpactRowsTests(unittest.TestCase):
         self.assertEqual(build_fix_impact_rows("der", []), [])
 
 
+class BuildCorrectionSummaryRowsTests(unittest.TestCase):
+    @staticmethod
+    def _entry(identity, action, reason, triples):
+        return (tuple(identity), action, reason, triples)
+
+    def test_no_derived_batches_is_one_all_zero_chain_summary(self) -> None:
+        self.assertEqual(
+            build_correction_summary_rows([]),
+            [["chain-summary", 0, 0, 0, 0]],
+        )
+
+    def test_empty_patches_contribute_no_steps(self) -> None:
+        ordered = [
+            ("d", [self._entry(["invalid", 2, "qty"], "fix", "r", [])]),
+            ("e", []),
+        ]
+        self.assertEqual(
+            build_correction_summary_rows(ordered),
+            [["chain-summary", 0, 0, 0, 0]],
+        )
+
+    def test_global_sequence_orders_batches_identities_and_triples(self) -> None:
+        ordered = [
+            (
+                "d1",
+                [
+                    # Entries and triples deliberately stored out of order.
+                    self._entry(
+                        ["invalid", 4, "qty"], "fix", "late",
+                        [[4, "qty", "8"], [2, "qty", "5"]],
+                    ),
+                    self._entry(
+                        ["duplicate", "A1", "S1"], "fix", "dup",
+                        [[2, "qty", "7"]],
+                    ),
+                ],
+            ),
+            (
+                "d2",
+                [
+                    self._entry(
+                        ["invalid", 2, "qty"], "confirm", "keep",
+                        [[2, "qty", "9"], [2, "status", "open"]],
+                    ),
+                ],
+            ),
+        ]
+        rows = build_correction_summary_rows(ordered)
+        # Cell (2, qty) sees, in execution order: the duplicate entry of d1
+        # ("duplicate" sorts before "invalid"), the invalid entry of d1,
+        # then d2.  The other cells see a single step.
+        self.assertEqual(
+            rows[0],
+            [
+                "cell", 2, "qty",
+                [
+                    ["d1", ["duplicate", "A1", "S1"], ["fix", "dup"], "7"],
+                    ["d1", ["invalid", 4, "qty"], ["fix", "late"], "5"],
+                    ["d2", ["invalid", 2, "qty"], ["confirm", "keep"], "9"],
+                ],
+                "9",
+            ],
+        )
+        self.assertEqual(
+            rows[1],
+            [
+                "cell", 2, "status",
+                [["d2", ["invalid", 2, "qty"], ["confirm", "keep"], "open"]],
+                "open",
+            ],
+        )
+        self.assertEqual(
+            rows[2],
+            [
+                "cell", 4, "qty",
+                [["d1", ["invalid", 4, "qty"], ["fix", "late"], "8"]],
+                "8",
+            ],
+        )
+        # 3 corrected cells, 5 steps, one cell touched repeatedly; final
+        # values originate from two distinct batches.
+        self.assertEqual(rows[3], ["chain-summary", 3, 5, 1, 2])
+
+    def test_repeated_cell_final_value_follows_execution_order(self) -> None:
+        ordered = [
+            ("a", [self._entry(["invalid", 2, "qty"], "fix", "r",
+                               [[2, "qty", "first"]])]),
+            ("b", [self._entry(["duplicate", "A1", "S1"], "fix", "r",
+                               [[2, "qty", "second"]])]),
+        ]
+        rows = build_correction_summary_rows(ordered)
+        self.assertEqual(rows[0][3][0][0], "a")
+        self.assertEqual(rows[0][3][1][0], "b")
+        self.assertEqual(rows[0][4], "second")
+        self.assertEqual(rows[1], ["chain-summary", 1, 2, 1, 1])
+
+        # Reversing the input order reverses execution: a now decides the
+        # final value.
+        rows = build_correction_summary_rows(list(reversed(ordered)))
+        self.assertEqual(rows[0][3][0][0], "b")
+        self.assertEqual(rows[0][4], "first")
+        self.assertEqual(rows[1], ["chain-summary", 1, 2, 1, 1])
+
+
 class FixImpactRunTests(BatchOrderDatabase):
     """Snapshot-driven fix rows through ``run_batch_order``."""
 
@@ -253,31 +358,55 @@ class FixImpactRunTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["der", "src"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        tags = [line[0] if line[0] in ("fix", "summary") else line[1] for line in lines]
+        tags = [
+            line[0]
+            if line[0] in ("cell", "chain-summary", "fix", "summary")
+            else line[1]
+            for line in lines
+        ]
         self.assertEqual(tags, [
+            "cell", "cell", "cell", "chain-summary",
             "derived", "fix", "fix", "fix", "source", "summary",
         ])
-        self.assertEqual(lines[0][:2], ["der", "derived"])
+        # Leading cross-batch summary: one cell row per corrected cell in
+        # (record number, field) order, then the chain-level conclusion.
+        self.assertEqual(
+            lines[0],
+            ["cell", 2, "qty",
+             [["der", ["invalid", 2, "qty"], ["fix", "q"], "5"]], "5"],
+        )
         self.assertEqual(
             lines[1],
+            ["cell", 4, "sku",
+             [["der", ["duplicate", "A1", "S1"], ["fix", "r"], "S7"]], "S7"],
+        )
+        self.assertEqual(
+            lines[2],
+            ["cell", 5, "sku",
+             [["der", ["invalid", 5, "sku"], ["fix", "r"], "S9"]], "S9"],
+        )
+        self.assertEqual(lines[3], ["chain-summary", 3, 3, 0, 1])
+        self.assertEqual(lines[4][:2], ["der", "derived"])
+        self.assertEqual(
+            lines[5],
             ["fix", "der", ["duplicate", "A1", "S1"], ["fix", "r"],
              [[4, "sku", "S7"]]],
         )
         self.assertEqual(
-            lines[2],
+            lines[6],
             ["fix", "der", ["invalid", 2, "qty"], ["fix", "q"],
              [[2, "qty", "5"]]],
         )
         self.assertEqual(
-            lines[3],
+            lines[7],
             ["fix", "der", ["invalid", 5, "sku"], ["fix", "r"],
              [[5, "sku", "S9"]]],
         )
         # The source batch emits no fix rows.
-        self.assertEqual(lines[4][:2], ["src", "source"])
-        # Summary counts only batches and never counts fix rows.
+        self.assertEqual(lines[8][:2], ["src", "source"])
+        # Summary counts only batches and never counts fix or summary rows.
         self.assertEqual(
-            lines[5], ["summary", 2, 1, 1, sorted(["h1", lines[4][4]])]
+            lines[9], ["summary", 2, 1, 1, sorted(["h1", lines[8][4]])]
         )
 
     def test_multiple_target_cells_are_all_listed_sorted(self) -> None:
@@ -294,15 +423,37 @@ class FixImpactRunTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["d1", "d2"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        self.assertEqual(lines[0][1], "derived")
+        # Leading summary covers the three cells d1 touched; d2's empty
+        # snapshot contributes no steps.
+        self.assertEqual(
+            [line[0] for line in lines[:5]],
+            ["cell", "cell", "cell", "chain-summary", "d1"],
+        )
+        self.assertEqual(
+            lines[0],
+            ["cell", 3, "qty",
+             [["d1", ["duplicate", "A1", "S1"], ["fix", "r"], "9"]], "9"],
+        )
         self.assertEqual(
             lines[1],
+            ["cell", 3, "sku",
+             [["d1", ["duplicate", "A1", "S1"], ["fix", "r"], "S2"]], "S2"],
+        )
+        self.assertEqual(
+            lines[2],
+            ["cell", 4, "sku",
+             [["d1", ["duplicate", "A1", "S1"], ["fix", "r"], "S7"]], "S7"],
+        )
+        self.assertEqual(lines[3], ["chain-summary", 3, 3, 0, 1])
+        self.assertEqual(lines[4][1], "derived")
+        self.assertEqual(
+            lines[5],
             ["fix", "d1", ["duplicate", "A1", "S1"], ["fix", "r"],
              [[3, "qty", "9"], [3, "sku", "S2"], [4, "sku", "S7"]]],
         )
         # Empty snapshot: provenance row only, no fix rows before summary.
-        self.assertEqual(lines[2][:2], ["d2", "derived"])
-        self.assertEqual(lines[3], ["summary", 2, 0, 2, ["h1", "h2"]])
+        self.assertEqual(lines[6][:2], ["d2", "derived"])
+        self.assertEqual(lines[7], ["summary", 2, 0, 2, ["h1", "h2"]])
 
     def test_multiple_derived_batches_order_by_input_then_identity(self) -> None:
         self.store_source("src")
@@ -318,10 +469,31 @@ class FixImpactRunTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["b", "a"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        tags = [line[0] if line[0] in ("fix", "summary") else line[1] for line in lines]
-        self.assertEqual(tags, ["derived", "fix", "derived", "fix", "summary"])
-        self.assertEqual([lines[1][1], lines[1][2]], ["b", ["invalid", 2, "qty"]])
-        self.assertEqual([lines[3][1], lines[3][2]], ["a", ["invalid", 3, "qty"]])
+        tags = [
+            line[0]
+            if line[0] in ("cell", "chain-summary", "fix", "summary")
+            else line[1]
+            for line in lines
+        ]
+        self.assertEqual(tags, [
+            "cell", "cell", "chain-summary",
+            "derived", "fix", "derived", "fix", "summary",
+        ])
+        # The global sequence follows batch input order: b before a.
+        self.assertEqual(
+            lines[0],
+            ["cell", 2, "qty",
+             [["b", ["invalid", 2, "qty"], ["fix", "r"], "5"]], "5"],
+        )
+        self.assertEqual(
+            lines[1],
+            ["cell", 3, "qty",
+             [["a", ["invalid", 3, "qty"], ["fix", "r"], "6"]], "6"],
+        )
+        self.assertEqual(lines[2], ["chain-summary", 2, 2, 0, 2])
+        self.assertEqual([lines[4][1], lines[4][2]], ["b", ["invalid", 2, "qty"]])
+        self.assertEqual([lines[6][1], lines[6][2]], ["a", ["invalid", 3, "qty"]])
+        self.assertEqual(lines[7][0], "summary")
 
     def test_snapshot_is_parsed_once_for_a_repeated_batch_id(self) -> None:
         self.store_source("src")
@@ -333,8 +505,24 @@ class FixImpactRunTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["der", "der"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        tags = [line[0] if line[0] in ("fix", "summary") else line[1] for line in lines]
-        self.assertEqual(tags, ["derived", "fix", "derived", "fix", "summary"])
+        tags = [
+            line[0]
+            if line[0] in ("cell", "chain-summary", "fix", "summary")
+            else line[1]
+            for line in lines
+        ]
+        # The repeated batch id explains its provenance twice, but its
+        # corrections feed the global sequence only once.
+        self.assertEqual(tags, [
+            "cell", "chain-summary",
+            "derived", "fix", "derived", "fix", "summary",
+        ])
+        self.assertEqual(
+            lines[0],
+            ["cell", 2, "qty",
+             [["der", ["invalid", 2, "qty"], ["fix", "r"], "5"]], "5"],
+        )
+        self.assertEqual(lines[1], ["chain-summary", 1, 1, 0, 1])
         self.assertEqual(lines[-1], ["summary", 2, 0, 2, ["h1"]])
 
     def test_corrupt_snapshot_is_fatal_without_partial_output(self) -> None:
@@ -396,6 +584,66 @@ class FixImpactRunTests(BatchOrderDatabase):
             run_batch_order(str(self.db_path), ["good", "bad"], stdout=out)
         self.assertEqual(out.getvalue(), b"")
 
+    def test_repeated_cell_across_batches_lists_every_step_and_winner(self) -> None:
+        self.store_source("src")
+        snap_a = self._snapshot(
+            self._snapshot_entry(
+                ["duplicate", "A1", "S1"],
+                [[2, "qty", "5"], [2, "status", "open"]],
+                reason="  first  ",
+            )
+        )
+        snap_b = self._snapshot(
+            self._snapshot_entry(["invalid", 2, "qty"], [[2, "qty", "9"]])
+        )
+        self.store_derived("a", "src", "ha", snap_a)
+        self.store_derived("b", "src", "hb", snap_b)
+        out = io.BytesIO()
+        code = run_batch_order(
+            str(self.db_path), ["src", "a", "b"], stdout=out
+        )
+        self.assertEqual(code, 0)
+        lines = parse_lines(out.getvalue())
+        # Two corrected cells; (2, qty) is rewritten by both batches.
+        self.assertEqual(
+            lines[0],
+            [
+                "cell", 2, "qty",
+                [
+                    ["a", ["duplicate", "A1", "S1"], ["fix", "first"], "5"],
+                    ["b", ["invalid", 2, "qty"], ["fix", "r"], "9"],
+                ],
+                "9",
+            ],
+        )
+        self.assertEqual(
+            lines[1],
+            [
+                "cell", 2, "status",
+                [["a", ["duplicate", "A1", "S1"], ["fix", "first"], "open"]],
+                "open",
+            ],
+        )
+        # 2 cells, 3 steps, 1 repeated, both batches own a final value.
+        self.assertEqual(lines[2], ["chain-summary", 2, 3, 1, 2])
+
+    def test_summary_leads_even_when_source_batch_is_first_input(self) -> None:
+        self.store_source("src")
+        snapshot = self._snapshot(
+            self._snapshot_entry(["invalid", 2, "qty"], [[2, "qty", "5"]])
+        )
+        self.store_derived("der", "src", "h1", snapshot)
+        out = io.BytesIO()
+        code = run_batch_order(
+            str(self.db_path), ["src", "der"], stdout=out
+        )
+        self.assertEqual(code, 0)
+        lines = parse_lines(out.getvalue())
+        self.assertEqual(lines[0][0], "cell")
+        self.assertEqual(lines[1], ["chain-summary", 1, 1, 0, 1])
+        self.assertEqual(lines[2][:2], ["src", "source"])
+        self.assertEqual(lines[-1], ["summary", 2, 1, 1, lines[-1][4]])
+
 
 class FixImpactEndToEndTests(BatchOrderDatabase):
     SCHEMA = json.dumps(
@@ -452,21 +700,33 @@ class FixImpactEndToEndTests(BatchOrderDatabase):
         )
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        self.assertEqual(len(lines), 5)
-        self.assertEqual(lines[0][:2], ["src", "source"])
-        self.assertEqual(lines[1], ["der", "derived", "src", "src", digest])
+        self.assertEqual(len(lines), 8)
+        # Cross-batch summary leads even though src is the first batch.
         self.assertEqual(
-            lines[2],
+            lines[0],
+            ["cell", 2, "qty",
+             [["der", ["invalid", 2, "qty"], ["fix", "q"], "5"]], "5"],
+        )
+        self.assertEqual(
+            lines[1],
+            ["cell", 3, "sku",
+             [["der", ["duplicate", "A1", "S1"], ["fix", "d"], "S2"]], "S2"],
+        )
+        self.assertEqual(lines[2], ["chain-summary", 2, 2, 0, 1])
+        self.assertEqual(lines[3][:2], ["src", "source"])
+        self.assertEqual(lines[4], ["der", "derived", "src", "src", digest])
+        self.assertEqual(
+            lines[5],
             ["fix", "der", ["duplicate", "A1", "S1"], ["fix", "d"],
              [[3, "sku", "S2"]]],
         )
         self.assertEqual(
-            lines[3],
+            lines[6],
             ["fix", "der", ["invalid", 2, "qty"], ["fix", "q"],
              [[2, "qty", "5"]]],
         )
-        self.assertEqual(lines[4][0], "summary")
-        self.assertEqual(lines[4][1:4], [2, 1, 1])
+        self.assertEqual(lines[7][0], "summary")
+        self.assertEqual(lines[7][1:4], [2, 1, 1])
 
 
 class RunBatchOrderTests(BatchOrderDatabase):
@@ -499,6 +759,7 @@ class RunBatchOrderTests(BatchOrderDatabase):
         self.assertEqual(
             lines,
             [
+                ["chain-summary", 0, 0, 0, 0],
                 ["d2", "derived", "root", "d1", "h2"],
                 ["d1", "derived", "root", "root", "h1"],
                 ["root", "source", "root", None, h0],
@@ -515,9 +776,10 @@ class RunBatchOrderTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["d2", "root"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        self.assertEqual(lines[0], ["d2", "derived", None, "d1", "h2"])
-        self.assertEqual(lines[1][1], "source")
-        self.assertEqual(lines[2], ["summary", 2, 1, 1, sorted({"h2", lines[1][4]})])
+        self.assertEqual(lines[0], ["chain-summary", 0, 0, 0, 0])
+        self.assertEqual(lines[1], ["d2", "derived", None, "d1", "h2"])
+        self.assertEqual(lines[2][1], "source")
+        self.assertEqual(lines[3], ["summary", 2, 1, 1, sorted({"h2", lines[2][4]})])
 
     def test_direct_source_that_never_existed_has_null_source(self) -> None:
         self.store_derived("d", "ghost", "h1")
@@ -525,7 +787,8 @@ class RunBatchOrderTests(BatchOrderDatabase):
         code = run_batch_order(str(self.db_path), ["d"], stdout=out)
         self.assertEqual(code, 0)
         lines = parse_lines(out.getvalue())
-        self.assertEqual(lines[0], ["d", "derived", None, "ghost", "h1"])
+        self.assertEqual(lines[0], ["chain-summary", 0, 0, 0, 0])
+        self.assertEqual(lines[1], ["d", "derived", None, "ghost", "h1"])
 
     def test_unknown_batch_is_fatal_without_partial_output(self) -> None:
         self.store_source("b1")
@@ -585,9 +848,12 @@ class BatchOrderCliTests(BatchOrderDatabase):
         result = run_cli("batch-order", "--db", str(self.db_path), "d", "b1")
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = parse_lines(result.stdout)
-        self.assertEqual(lines[0][:4], ["d", "derived", "b1", "b1"])
-        self.assertEqual(lines[1][:4], ["b1", "source", "b1", None])
-        self.assertEqual(lines[2][0], "summary")
+        # d carries an empty snapshot, so only the all-zero chain summary
+        # precedes the provenance rows.
+        self.assertEqual(lines[0], ["chain-summary", 0, 0, 0, 0])
+        self.assertEqual(lines[1][:4], ["d", "derived", "b1", "b1"])
+        self.assertEqual(lines[2][:4], ["b1", "source", "b1", None])
+        self.assertEqual(lines[3][0], "summary")
 
     def test_cli_emits_fix_rows_from_derived_snapshot(self) -> None:
         self.store_source("b1")
@@ -607,15 +873,26 @@ class BatchOrderCliTests(BatchOrderDatabase):
         result = run_cli("batch-order", "--db", str(self.db_path), "d", "b1")
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = parse_lines(result.stdout)
-        self.assertEqual(lines[0][:2], ["d", "derived"])
+        self.assertEqual(
+            lines[0],
+            ["cell", 3, "qty",
+             [["d", ["duplicate", "A1", "S1"], ["fix", "d"], "9"]], "9"],
+        )
         self.assertEqual(
             lines[1],
+            ["cell", 4, "sku",
+             [["d", ["duplicate", "A1", "S1"], ["fix", "d"], "S7"]], "S7"],
+        )
+        self.assertEqual(lines[2], ["chain-summary", 2, 2, 0, 1])
+        self.assertEqual(lines[3][:2], ["d", "derived"])
+        self.assertEqual(
+            lines[4],
             ["fix", "d", ["duplicate", "A1", "S1"], ["fix", "d"],
              [[3, "qty", "9"], [4, "sku", "S7"]]],
         )
-        self.assertEqual(lines[2][:2], ["b1", "source"])
+        self.assertEqual(lines[5][:2], ["b1", "source"])
         self.assertEqual(
-            lines[3], ["summary", 2, 1, 1, sorted(["h1", lines[2][4]])]
+            lines[6], ["summary", 2, 1, 1, sorted(["h1", lines[5][4]])]
         )
 
     def test_cli_corrupt_snapshot_exits_two_with_empty_stdout(self) -> None:

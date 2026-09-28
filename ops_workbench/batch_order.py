@@ -13,8 +13,13 @@ applied to derive it: one ``"fix"`` row per entry of the decision/proposal
 snapshot saved by ``apply-fixes``, ordered by finding identity, placed
 right after that batch's provenance row.  A snapshot that cannot be
 explained faithfully (invalid JSON, or an entry missing its identity,
-decision or proposal) is a fatal error before anything is emitted.  Only
-the Python standard library is used.
+decision or proposal) is a fatal error before anything is emitted.
+
+When the run includes one or more derived batches, a cross-batch summary
+is emitted before every provenance row: one ``"cell"`` row per cell
+corrected at least once (listing every correction step in execution
+order, with the final value), followed by one ``"chain-summary"`` row.
+Only the Python standard library is used.
 """
 
 from __future__ import annotations
@@ -274,6 +279,71 @@ def build_fix_impact_rows(
     return rows
 
 
+def build_correction_summary_rows(
+    ordered_derived: list[tuple[str, list[tuple]]],
+) -> list[list]:
+    """Build the cross-batch correction summary rows.
+
+    ``ordered_derived`` lists ``(derived batch id, parsed snapshot entries)``
+    for the distinct derived batches in their first-input-occurrence order.
+
+    The corrections are flattened into one global execution sequence: the
+    derived batches run in their input order, within a batch the snapshot
+    entries run by ascending identity, and within an entry the new-value
+    triples run by record number then field name.  Every target cell of
+    every triple is one correction step shaped
+    ``[derived batch id, identity, [action, reason], new value]``; a derived
+    batch whose snapshot contributes no triples adds no steps.
+
+    For each cell corrected at least once a
+    ``["cell", record number, field, steps, final value]`` row is emitted:
+    ``steps`` lists every step that touched the cell in execution order and
+    ``final value`` is the new value of the last step.  Cell rows are
+    ordered by record number then field name.  The closing row is
+    ``["chain-summary", corrected cell count, total step count, repeatedly
+    modified cell count, final-value source batch count]``: a cell is
+    repeatedly modified when it occurs more than once in the execution
+    sequence, and the source batch count is the number of distinct derived
+    batches owning the cells' final steps.  With no correction steps at all
+    only the all-zero ``"chain-summary"`` row is returned.
+    """
+    # One correction step per target cell, in global execution order.
+    steps: list[tuple[int, str, list]] = []
+    for derived_id, entries in ordered_derived:
+        for identity, action, reason, triples in sorted(
+            entries, key=lambda entry: entry[0]
+        ):
+            decision = [action, reason]
+            for recno, field, new_value in sorted(
+                triples, key=lambda triple: (triple[0], triple[1])
+            ):
+                steps.append(
+                    (
+                        recno,
+                        field,
+                        [derived_id, list(identity), decision, new_value],
+                    )
+                )
+
+    by_cell: dict[tuple[int, str], list[list]] = {}
+    for recno, field, step in steps:
+        by_cell.setdefault((recno, field), []).append(step)
+
+    rows: list[list] = []
+    repeated = 0
+    final_sources: set[str] = set()
+    for recno, field in sorted(by_cell):
+        cell_steps = by_cell[(recno, field)]
+        if len(cell_steps) > 1:
+            repeated += 1
+        final_sources.add(cell_steps[-1][0])
+        rows.append(["cell", recno, field, cell_steps, cell_steps[-1][3]])
+    rows.append(
+        ["chain-summary", len(by_cell), len(steps), repeated, len(final_sources)]
+    )
+    return rows
+
+
 def run_batch_order(
     db_path: str,
     batch_ids: list[str],
@@ -286,7 +356,10 @@ def run_batch_order(
     :class:`AuditError` (exit 2) before anything is written, so no partial
     results are produced and the database is never modified.  A derived
     batch whose saved snapshot is invalid JSON or structurally incomplete
-    fails the same way before the report is generated.
+    fails the same way before the report is generated.  When the run
+    contains a derived batch, cross-batch correction summary rows (see
+    :func:`build_correction_summary_rows`) lead the report; they never
+    affect the provenance rows or the trailing summary.
     """
     batches, derived = _read_tables(db_path)
     for batch_id in batch_ids:
@@ -304,14 +377,28 @@ def run_batch_order(
             )
 
     provenance = build_batch_order(batches, derived, batch_ids)
-    rows: list[list] = []
+    body_rows: list[list] = []
     for row in provenance[:-1]:
-        rows.append(row)
+        body_rows.append(row)
         if row[1] == DERIVED:
             # Fix-impact rows sit directly behind this batch's provenance
             # row and before the next batch's provenance row.  They never
             # contribute to the trailing summary.
-            rows.extend(build_fix_impact_rows(row[0], snapshots[row[0]]))
+            body_rows.extend(build_fix_impact_rows(row[0], snapshots[row[0]]))
+
+    # The cross-batch correction summary, when derived batches are in play,
+    # leads the report ahead of every provenance row.  Each distinct
+    # derived batch contributes once, in its first input-occurrence order;
+    # the snapshots dict was populated the same way above.
+    rows: list[list] = []
+    if any(batch_id in derived for batch_id in batch_ids):
+        ordered_derived = [
+            (batch_id, snapshots[batch_id])
+            for batch_id in dict.fromkeys(batch_ids)
+            if batch_id in derived
+        ]
+        rows.extend(build_correction_summary_rows(ordered_derived))
+    rows.extend(body_rows)
     rows.append(provenance[-1])
 
     emit_report(serialize(rows), output_path, stdout)
